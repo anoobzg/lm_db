@@ -4,7 +4,7 @@ project(lm_db)
 
 set(BUILD_DEMO 0)
 
-if(${PROJECT_NAME} STREQUAL "lm_db")
+if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
     include(cmake_tools/entry/desktop-cpp.cmake)
     __install_conan_requirements(MSVC_RUNTIME "dynamic")
 
