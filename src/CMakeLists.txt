@@ -1,15 +1,17 @@
 __enable_cxx17()
 
-set(SRCS impl/lmuserdb.cpp)
+set(SRCS impl/lmdbcore.cpp
+           impl/aes_encryption.cpp
+           impl/gcode_processor.cpp)
 
 if(NOT TARGET SQLite::SQLite3)
     find_package(SQLite3 REQUIRED)
 endif()
-if(NOT TARGET openssl::openssl)
+if(NOT TARGET OpenSSL::Crypto)
     find_package(OpenSSL REQUIRED)
 endif()
 
-set(LIBS SQLite::SQLite3 openssl::openssl)
+set(LIBS SQLite::SQLite3 OpenSSL::Crypto OpenSSL::SSL)
 
 set(INCS ${CMAKE_CURRENT_SOURCE_DIR} 
         ${CMAKE_CURRENT_SOURCE_DIR}/include 
