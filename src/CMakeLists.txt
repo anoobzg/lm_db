@@ -1,6 +1,7 @@
 __enable_cxx17()
 
 set(SRCS impl/lmdbcore.cpp
+            impl/lmuserdb.cpp
            impl/aes_encryption.cpp
            impl/gcode_processor.cpp)
 

@@ -2,9 +2,26 @@
 
 #include "sqlite.hpp"
 #include "dbng.hpp"
+#include "lm/gcode/gcode_processor.h"
+#include "lm/crypto/aes_encryption.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <fstream>
+#include <random>
+#include <iomanip>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+
+// Helper function to convert bytes to hex string
+std::string bytesToHex(const std::vector<uint8_t>& bytes) {
+    std::ostringstream oss;
+    for (uint8_t byte : bytes) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+    return oss.str();
+}
 
 // Register ORM mappings
 REGISTER_AUTO_KEY(User, id)
@@ -1002,11 +1019,189 @@ namespace lmdb {
         std::cout << "print start ---------------- \n";
         auto vec = impl->sqlite.query<User>(query);
         for (const auto& user : vec) {
-            std::cout << user.id << ", "  << ", " << user.name << ", " 
+            std::cout << user.id << ", " << user.name << ", " 
                       << user.email << ", " << user.phone << ", role=" << user.role << "\n";
         }
 
         std::cout << "print end ------------------\n";
         std::cout << std::endl;
+    }
+
+    // Test function to populate database with sample data
+    void lmDBCore::populate_test_data()
+    {
+        std::cout << "\n=== Populating database with test data ===\n";
+        
+        try {
+            // Add test users with different roles
+            std::cout << "Adding test users...\n";
+            
+            // Admin user (role = 4)
+            add_user("admin", "admin@lightmaker.local", "+86-10-12345678", "LightMaker HQ", ADMIN);
+            set_password("admin", "admin123");
+            
+            // Manager user (role = 3)
+            add_user("manager1", "manager1@lightmaker.local", "+86-10-12345679", "Management Office", MANAGER);
+            set_password("manager1", "mgr123");
+            
+            // Operator users (role = 2)
+            add_user("operator1", "operator1@lightmaker.local", "+86-10-12345680", "Production Floor", OPERATOR);
+            set_password("operator1", "op123");
+            
+            add_user("operator2", "operator2@lightmaker.local", "+86-10-12345681", "Production Floor", OPERATOR);
+            set_password("operator2", "op456");
+            
+            // Regular users (role = 1)
+            add_user("user1", "user1@lightmaker.local", "+86-10-12345682", "User Area", USER);
+            set_password("user1", "user123");
+            
+            add_user("user2", "user2@lightmaker.local", "+86-10-12345683", "User Area", USER);
+            set_password("user2", "user456");
+            
+            // Guest users (role = 0)
+            add_user("guest1", "guest1@lightmaker.local", "+86-10-12345684", "Guest Area", GUEST);
+            set_password("guest1", "guest123");
+            
+            add_user("guest2", "guest2@lightmaker.local", "+86-10-12345685", "Guest Area", GUEST);
+            set_password("guest2", "guest456");
+            
+            // Add test customers
+            std::cout << "Adding test customers...\n";
+            add_customer("ABC Company", "+86-21-12345678");
+            add_customer("XYZ Corp", "+86-755-87654321");
+            add_customer("Tech Solutions Ltd", "+86-10-11223344");
+            
+            // Add test orders
+            std::cout << "Adding test orders...\n";
+            add_order("Prototype Parts", "Initial prototype for ABC Company", "1");
+            add_order("Production Batch 1", "First production batch", "1");
+            add_order("Custom Design", "Custom 3D printed parts for XYZ Corp", "2");
+            add_order("R&D Samples", "Research and development samples", "3");
+            
+            // Add test print tasks
+            std::cout << "Adding test print tasks...\n";
+            add_print_task(1, "Part A - Prototype", "part_a_proto.gcode", 5);
+            add_print_task(1, "Part B - Prototype", "part_b_proto.gcode", 3);
+            add_print_task(2, "Part A - Production", "part_a_prod.gcode", 100);
+            add_print_task(3, "Custom Part 1", "custom_part1.gcode", 10);
+            add_print_task(4, "Sample 1", "sample1.gcode", 2);
+            
+            // Update some print progress
+            update_print_progress(1, 3); // Part A - Prototype: 3/5 completed
+            update_print_progress(2, 3); // Part B - Prototype: 3/3 completed
+            update_print_progress(3, 25); // Part A - Production: 25/100 completed
+            
+            // Add test gcode files
+            std::cout << "Adding test gcode files...\n";
+            auto key1_bytes = lm::crypto::AESEncryption::generateRandomKey();
+            auto key2_bytes = lm::crypto::AESEncryption::generateRandomKey();
+            auto key3_bytes = lm::crypto::AESEncryption::generateRandomKey();
+            
+            // Convert keys to hex strings for storage
+            std::string key1 = bytesToHex(key1_bytes);
+            std::string key2 = bytesToHex(key2_bytes);
+            std::string key3 = bytesToHex(key3_bytes);
+            
+            add_gcode_file("part_a_proto.gcode", "./enc_resource/part_a_proto.enc", key1);
+            add_gcode_file("part_b_proto.gcode", "./enc_resource/part_b_proto.enc", key2);
+            add_gcode_file("custom_part1.gcode", "./enc_resource/custom_part1.enc", key3);
+            
+            std::cout << "Test data populated successfully!\n";
+            std::cout << "Generated AES keys:\n";
+            std::cout << "  Key 1: " << key1 << "\n";
+            std::cout << "  Key 2: " << key2 << "\n";
+            std::cout << "  Key 3: " << key3 << "\n";
+            
+        } catch (const std::exception &e) {
+            std::cerr << "Error populating test data: " << e.what() << std::endl;
+        }
+        
+        std::cout << "==========================================\n\n";
+    }
+
+    // Test G-code encryption and decryption functionality
+    void lmDBCore::test_gcode_encryption_decryption()
+    {
+        std::cout << "\n=== Testing G-code Encryption/Decryption ===\n";
+        
+        try {
+            // Create a sample G-code file for testing
+            std::string sample_gcode_path = "./data/test_sample.gcode";
+            std::string encrypted_path = "./data/test_sample.gcode.enc";
+            std::string decrypted_path = "./data/test_sample_decrypted.gcode";
+            
+            std::cout << "1. Creating sample G-code file...\n";
+            if (!lm::gcode::GCodeProcessor::createSampleGCodeFile(sample_gcode_path)) {
+                std::cerr << "Failed to create sample G-code file" << std::endl;
+                return;
+            }
+            std::cout << "   Sample G-code file created: " << sample_gcode_path << std::endl;
+            
+            // Display file info
+            std::cout << "\n2. Sample G-code file info:\n";
+            std::cout << lm::gcode::GCodeProcessor::getGCodeFileInfo(sample_gcode_path) << std::endl;
+            
+            // Test encryption with random password
+            std::cout << "3. Testing encryption with random password...\n";
+            
+            // Generate random password
+            auto random_key = lm::crypto::AESEncryption::generateRandomKey();
+            std::string password = bytesToHex(random_key);
+            std::cout << "   Generated random password: " << password.substr(0, 16) << "..." << std::endl;
+            
+            // Create processor with random password
+            lm::gcode::GCodeProcessor processor(password);
+            
+            if (processor.encryptGCodeFile(sample_gcode_path, encrypted_path)) {
+                std::cout << "   ✓ Encryption successful: " << encrypted_path << std::endl;
+                
+                // Store G-code file info in database
+                std::cout << "   Storing G-code info in database...\n";
+                bool db_success = add_gcode_file("test_sample.gcode", encrypted_path, password);
+                if (db_success) {
+                    std::cout << "   ✓ G-code info stored in database successfully\n";
+                } else {
+                    std::cout << "   ⚠ Failed to store G-code info in database\n";
+                }
+            } else {
+                std::cerr << "   ✗ Encryption failed" << std::endl;
+                return;
+            }
+            
+            // Test decryption using password from database
+            std::cout << "\n4. Testing decryption using password from database...\n";
+            
+            // Get G-code file info from database by filename
+            Gcode_file test_file = get_gcode_file_by_filename("test_sample.gcode");
+            if (test_file.filename.empty()) {
+                std::cerr << "   ✗ Test G-code file not found in database" << std::endl;
+                return;
+            }
+            
+            std::cout << "   Retrieved password from database: " << test_file.aeskey.substr(0, 16) << "..." << std::endl;
+            
+            // Create new processor with password from database
+            lm::gcode::GCodeProcessor db_processor(test_file.aeskey);
+            
+            if (db_processor.decryptGCodeFile(encrypted_path, decrypted_path)) {
+                std::cout << "   ✓ Decryption successful using database password: " << decrypted_path << std::endl;
+            } else {
+                std::cerr << "   ✗ Decryption failed" << std::endl;
+                return;
+            }
+            
+            // Verify decrypted file
+            std::cout << "\n5. Verifying decrypted file...\n";
+            if (lm::gcode::GCodeProcessor::validateGCodeFile(decrypted_path)) {
+                std::cout << "   ✓ Decrypted file is valid G-code" << std::endl;
+            } else {
+                std::cerr << "   ✗ Decrypted file is not valid G-code" << std::endl;
+                return;
+            }
+            
+            
+        } catch (const std::exception& e) {
+            std::cerr << "G-code encryption/decryption test error: " << e.what() << std::endl;
+        }
     }
 }

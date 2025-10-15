@@ -5,6 +5,16 @@
 #include <ctime>
 #include <chrono>
 
+
+enum  USER_ROLE
+{
+    GUEST = 0,
+    USER = 1,
+    OPERATOR = 2,
+    MANAGER = 3,
+    ADMIN = 4
+};
+
 // User data structure (matches user_service.proto)
 struct User
 {
@@ -224,6 +234,12 @@ namespace lmdb
         void clear_all_data();
         void print_database_status();
         void print(const std::string &query = "");
+        
+        // Test functions
+        void populate_test_data();
+        
+        // G-code encryption/decryption test functions
+        void test_gcode_encryption_decryption();
 
     protected:
         lmDBCoreImpl *impl;
