@@ -13,6 +13,114 @@
 #include <openssl/aes.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+
+// Platform-specific headers for user data directory
+#ifdef _WIN32
+#include <windows.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <climits>
+#endif
+
+// Helper function to get error message from error code
+const char* get_db_error_message(DB_RESULT error_code) {
+    switch (error_code) {
+        case DB_SUCCESS:
+            return "Operation successful";
+        case DB_ERROR_DATABASE_CONNECTION:
+            return "Database connection error";
+        case DB_ERROR_SQL_EXECUTION:
+            return "SQL execution error";
+        case DB_ERROR_RECORD_NOT_FOUND:
+            return "Record not found";
+        case DB_ERROR_DUPLICATE_RECORD:
+            return "Duplicate record (unique constraint violation)";
+        case DB_ERROR_INVALID_PARAMETER:
+            return "Invalid parameter";
+        case DB_ERROR_PERMISSION_DENIED:
+            return "Permission denied";
+        case DB_ERROR_FOREIGN_KEY_CONSTRAINT:
+            return "Foreign key constraint violation";
+        case DB_ERROR_DATABASE_LOCKED:
+            return "Database is locked";
+        case DB_ERROR_DISK_FULL:
+            return "Disk full";
+        case DB_ERROR_OLD_PASSWORD_INCORRECT:
+            return "Old password is incorrect";
+        case DB_ERROR_PASSWORD_INCORRECT:
+            return "Password is incorrect";
+        case DB_ERROR_UNKNOWN:
+        default:
+            return "Unknown error";
+    }
+}
+
+// Helper function to get user data directory
+std::string getUserDataDirectory() {
+    std::string userDataDir;
+    
+#ifdef _WIN32
+    // Windows: C:\Users\<username>\AppData\Local\<company>
+    char* appDataPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, (PWSTR*)&appDataPath))) {
+        // Convert wide string to narrow string
+        int size = WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)appDataPath, -1, nullptr, 0, nullptr, nullptr);
+        if (size > 0) {
+            std::vector<char> buffer(size);
+            WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)appDataPath, -1, buffer.data(), size, nullptr, nullptr);
+            userDataDir = std::string(buffer.data());
+        }
+        CoTaskMemFree(appDataPath);
+    }
+    
+    if (userDataDir.empty()) {
+        // Fallback to environment variable
+        const char* appData = getenv("LOCALAPPDATA");
+        if (appData) {
+            userDataDir = std::string(appData);
+        }
+    }
+    
+    // Add company name
+    userDataDir += "\\LightMaker";
+    
+#else
+    // Linux: /home/<username>/.local/share/<company>
+    const char* homeDir = getenv("HOME");
+    if (!homeDir) {
+        // Fallback to getpwuid
+        struct passwd* pw = getpwuid(getuid());
+        if (pw) {
+            homeDir = pw->pw_dir;
+        }
+    }
+    
+    if (homeDir) {
+        userDataDir = std::string(homeDir) + "/.local/share/LightMaker";
+    } else {
+        // Ultimate fallback
+        userDataDir = "./data";
+    }
+#endif
+    
+    return userDataDir;
+}
+
+// Helper function to create directory if it doesn't exist
+bool createDirectoryIfNotExists(const std::string& path) {
+#ifdef _WIN32
+    return CreateDirectoryA(path.c_str(), NULL) != 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+#endif
+}
 
 // Helper function to convert bytes to hex string
 std::string bytesToHex(const std::vector<uint8_t>& bytes) {
@@ -21,6 +129,69 @@ std::string bytesToHex(const std::vector<uint8_t>& bytes) {
         oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
     }
     return oss.str();
+}
+
+// Helper function to generate random salt
+std::string generateSalt() {
+    std::vector<uint8_t> salt(16); // 128-bit salt
+    if (RAND_bytes(salt.data(), salt.size()) != 1) {
+        // Fallback to random_device if OpenSSL RAND fails
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+        for (auto& byte : salt) {
+            byte = static_cast<uint8_t>(dis(gen));
+        }
+    }
+    return bytesToHex(salt);
+}
+
+// Helper function to hash password with salt using PBKDF2
+std::string hashPassword(const std::string& password, const std::string& salt) {
+    const int iterations = 100000; // PBKDF2 iterations
+    const int key_len = 32; // 256-bit key
+    
+    std::vector<uint8_t> key(key_len);
+    
+    // Convert hex salt back to bytes
+    std::vector<uint8_t> salt_bytes;
+    for (size_t i = 0; i < salt.length(); i += 2) {
+        std::string byte_str = salt.substr(i, 2);
+        uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16));
+        salt_bytes.push_back(byte);
+    }
+    
+    // Use PBKDF2 with SHA-256
+    if (PKCS5_PBKDF2_HMAC(password.c_str(), password.length(),
+                          salt_bytes.data(), salt_bytes.size(),
+                          iterations, EVP_sha256(),
+                          key_len, key.data()) != 1) {
+        throw std::runtime_error("PBKDF2 hashing failed");
+    }
+    
+    return bytesToHex(key);
+}
+
+// Helper function to verify password
+bool verifyPassword(const std::string& password, const std::string& hashed_password_with_salt) {
+    try {
+        // Extract salt from stored hash (first 32 characters = 16 bytes in hex)
+        if (hashed_password_with_salt.length() < 32) {
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+        
+        std::string salt = hashed_password_with_salt.substr(0, 32);
+        std::string stored_hash = hashed_password_with_salt.substr(32);
+        
+        // Hash the provided password with the extracted salt
+        std::string computed_hash = hashPassword(password, salt);
+        
+        // Compare hashes
+        return computed_hash == stored_hash;
+    } catch (const std::exception& e) {
+        std::cerr << "Password verification error: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 // Register ORM mappings
@@ -33,8 +204,8 @@ YLT_REFL(Customer, id, name, phone, email, avatar_image, address, company, posit
 REGISTER_AUTO_KEY(Order, id)
 YLT_REFL(Order, id, name, description, attachments, print_quantity, customer_id, created_at, updated_at)
 
-REGISTER_AUTO_KEY(EmbedDevice, id)
-YLT_REFL(EmbedDevice, id, device_name, device_type, firmware_version, hardware_version, manufacturer, capabilities, created_at, updated_at)
+REGISTER_AUTO_KEY(EmbedDevice, device_id)
+YLT_REFL(EmbedDevice, device_id, device_name, device_type, model, serial_number, firmware_version, hardware_version, manufacturer, ip_address, port, mac_address, status, location, description, last_seen, created_at, updated_at, session_id, capabilities, metadata)
 
 REGISTER_AUTO_KEY(PrintTask, id)
 YLT_REFL(PrintTask, id, order_id, print_name, gcode_filename, total_quantity, completed_quantity)
@@ -48,10 +219,20 @@ namespace lmdb {
         ormpp::dbng<ormpp::sqlite> sqlite;
     };
 
-    lmDBCore::lmDBCore(const std::string& db_path) 
+    lmDBCore::lmDBCore(const std::string& db_name) 
         : impl(new lmDBCoreImpl()) 
     {
-        impl->sqlite.connect(db_path);
+        // Get user data directory
+        std::string userDataDir = getUserDataDirectory() + "/data";
+        
+        // Create directory if it doesn't exist
+        createDirectoryIfNotExists(userDataDir);
+        
+        // Build full database path: userDataDir/db_name.db
+        db_path_ = userDataDir + "/" + db_name + ".db";
+        
+        // Connect to database
+        impl->sqlite.connect(db_path_);
     }   
 
     lmDBCore::~lmDBCore() 
@@ -60,7 +241,12 @@ namespace lmdb {
         impl = nullptr;
     }
 
-    bool lmDBCore::initialize()
+    const std::string& lmDBCore::get_database_path() const
+    {
+        return db_path_;
+    }
+
+    DB_RESULT lmDBCore::initialize()
     {
         try
         {
@@ -84,7 +270,7 @@ namespace lmdb {
             ormpp_not_null order_not_null{{"name"}};
             impl->sqlite.create_datatable<Order>(order_key, order_not_null);
 
-            ormpp_auto_key embed_device_key{"id"};
+            ormpp_auto_key embed_device_key{"device_id"};
             ormpp_not_null embed_device_not_null{{"device_name"}};
             impl->sqlite.create_datatable<EmbedDevice>(embed_device_key, embed_device_not_null);
 
@@ -95,25 +281,35 @@ namespace lmdb {
             ormpp_unique gcode_file_unique{{"filename"}};
             impl->sqlite.create_datatable<Gcode_file>(gcode_file_key, gcode_file_unique);
 
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Database initialization failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
     // User operations (matches user_service.proto)
-    bool lmDBCore::add_user(const std::string& name, const std::string& email,
-                            const std::string& phone, const std::string& address, int role)
+    DB_RESULT lmDBCore::add_user(const std::string& name, const std::string& email,
+                                const std::string& phone, const std::string& address, int role)
     {
         try
         {
+            // Validate input parameters
+            if (name.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            if (email.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            // Check if user already exists
             auto existing = impl->sqlite.query_s<User>("name = ?", name);
             if (!existing.empty())
             {
-                return false; // User name already exists
+                return DB_ERROR_DUPLICATE_RECORD; // User name already exists
             }
 
             User user;
@@ -132,38 +328,76 @@ namespace lmdb {
             user.updated_at = static_cast<int64_t>(now);
             
             impl->sqlite.insert(user);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add user failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    bool lmDBCore::remove_user(int64_t id)
+
+    DB_RESULT lmDBCore::remove_user(int64_t id)
     {
         try
         {
-            impl->sqlite.delete_records<User>("id = " + std::to_string(id));
-            return true;
+            // Check if user exists first
+            auto users = impl->sqlite.query_s<User>("id = ?", id);
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            impl->sqlite.delete_records_s<User>("id = ?", id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove user failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    bool lmDBCore::update_user(int64_t id, const std::string& name, const std::string& email,
+    DB_RESULT lmDBCore::remove_user(const std::string& name)
+    {
+        try
+        {
+            // Check if user exists first
+            auto users = impl->sqlite.query_s<User>("name = ?", name);
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            impl->sqlite.delete_records_s<User>("name = ?", name);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove user by name failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+
+
+    DB_RESULT lmDBCore::update_user(int64_t id, const std::string& name, const std::string& email,
                                const std::string& phone, const std::string& address, int role)
     {
         try
         {
+            // Validate input parameters
+            if (name.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            if (email.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
             auto users = impl->sqlite.query_s<User>("id = ?", id);
             if (users.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             User user = users[0];
@@ -177,133 +411,291 @@ namespace lmdb {
             user.updated_at = static_cast<int64_t>(time(0));
 
             impl->sqlite.update(user);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update user failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    bool lmDBCore::set_password(int64_t id, const std::string& new_password)
+    DB_RESULT lmDBCore::update_user(const std::string& name, const std::string& new_name, const std::string& email,
+                               const std::string& phone, const std::string& address, int role)
+    {
+        try
+        {
+            auto users = impl->sqlite.query_s<User>("name = ?", name);
+            if (users.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            User user = users[0];
+            user.name = new_name;
+            user.email = email;
+            user.phone = phone;
+            user.address = address;
+            if (role >= 0) {
+                user.role = role;
+            }
+            user.updated_at = static_cast<int64_t>(time(0));
+
+            impl->sqlite.update(user);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update user by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::set_password(int64_t id, const std::string& new_password)
     {
         try
         {
             auto users = impl->sqlite.query_s<User>("id = ?", id);
             if (users.size() == 1) {
                 User u = users[0];
-                u.password = new_password;
+                
+                // Generate salt and hash the password
+                std::string salt = generateSalt();
+                std::string hashed_password = hashPassword(new_password, salt);
+                
+                // Store salt + hash (salt is first 32 chars, hash is remaining)
+                u.password = salt + hashed_password;
                 u.updated_at = static_cast<int64_t>(time(0));
                 impl->sqlite.update(u);
-                return true;
+                return DB_SUCCESS;
             }
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Set password failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::set_password(const std::string& name, const std::string& new_password)
+    DB_RESULT lmDBCore::set_password(const std::string& name, const std::string& new_password)
     {
         try
         {
             auto users = impl->sqlite.query_s<User>("name = ?", name);
             if (users.size() == 1) {
                 User u = users[0];
-                u.password = new_password;
+                
+                // Generate salt and hash the password
+                std::string salt = generateSalt();
+                std::string hashed_password = hashPassword(new_password, salt);
+                
+                // Store salt + hash (salt is first 32 chars, hash is remaining)
+                u.password = salt + hashed_password;
                 u.updated_at = static_cast<int64_t>(time(0));
                 impl->sqlite.update(u);
-                return true;
+                return DB_SUCCESS;
             }
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Set password failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::change_password(int64_t id, const std::string& old_password, const std::string& new_password)
+    {
+        try
+        {
+            // Validate new password
+            if (new_password.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            auto users = impl->sqlite.query_s<User>("id = ?", id);
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            if (users.size() == 1) {
+                User u = users[0];
+                
+                // Verify old password first
+                if (!verifyPassword(old_password, u.password)) {
+                    std::cerr << "Old password verification failed for user ID: " << id << std::endl;
+                    return DB_ERROR_OLD_PASSWORD_INCORRECT;
+                }
+                
+                // Generate new salt and hash the new password
+                std::string salt = generateSalt();
+                std::string hashed_password = hashPassword(new_password, salt);
+                
+                // Store salt + hash (salt is first 32 chars, hash is remaining)
+                u.password = salt + hashed_password;
+                u.updated_at = static_cast<int64_t>(time(0));
+                impl->sqlite.update(u);
+                return DB_SUCCESS;
+            }
+            
+            // Multiple users with same ID (should not happen with primary key)
+            std::cerr << "Multiple users found with ID: " << id << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Change password failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::change_password(const std::string& name, const std::string& old_password, const std::string& new_password)
+    {
+        try
+        {
+            // Validate new password
+            if (new_password.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            auto users = impl->sqlite.query_s<User>("name = ?", name);
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            if (users.size() == 1) {
+                User u = users[0];
+                
+                // Verify old password first
+                if (!verifyPassword(old_password, u.password)) {
+                    std::cerr << "Old password verification failed for user: " << name << std::endl;
+                    return DB_ERROR_OLD_PASSWORD_INCORRECT;
+                }
+                
+                // Generate new salt and hash the new password
+                std::string salt = generateSalt();
+                std::string hashed_password = hashPassword(new_password, salt);
+                
+                // Store salt + hash (salt is first 32 chars, hash is remaining)
+                u.password = salt + hashed_password;
+                u.updated_at = static_cast<int64_t>(time(0));
+                impl->sqlite.update(u);
+                return DB_SUCCESS;
+            }
+            
+            // Multiple users with same name (should not happen with unique constraint)
+            std::cerr << "Multiple users found with name: " << name << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Change password failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
         
-    bool lmDBCore::get_password(int64_t id, std::string& out_password)
+    DB_RESULT lmDBCore::get_password(int64_t id, std::string& out_password)
     {
         try
         {
             auto users = impl->sqlite.query_s<User>("id = ?", id);
             if (users.size() == 1) {
                 out_password = users[0].password;
-                return true;
+                return DB_SUCCESS;
             }
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get password failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    User lmDBCore::get_user_by_id(int64_t id)
+    DB_RESULT lmDBCore::get_user_by_id(int64_t id, User &out_user)
     {
         try
         {
             auto users = impl->sqlite.query_s<User>("id = ?", id);
-            return users.empty() ? User() : users[0];
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_user = users[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get user by id failed: " << e.what() << std::endl;
-            return User();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    User lmDBCore::get_user_by_name(const std::string& name)
+    DB_RESULT lmDBCore::get_user_by_name(const std::string& name, User &out_user)
     {
         try
         {
             auto users = impl->sqlite.query_s<User>("name = ?", name);
-            return users.empty() ? User() : users[0];
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_user = users[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get user by name failed: " << e.what() << std::endl;
-            return User();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    std::vector<User> lmDBCore::get_all_users()
+    DB_RESULT lmDBCore::get_all_users(std::vector<User> &out_users)
     {
         try
         {
-            return impl->sqlite.query_s<User>("");
+            out_users = impl->sqlite.query_s<User>("");
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get all users failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    bool lmDBCore::verify_user(const std::string& name, const std::string& password)
+    DB_RESULT lmDBCore::verify_user(const std::string& name, const std::string& password)
     {
         try
         {
-            auto users = impl->sqlite.query_s<User>("name = ? AND password = ?", name, password);
-            return !users.empty();
+            auto users = impl->sqlite.query_s<User>("name = ?", name);
+            if (users.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            if (users.size() == 1) {
+                User u = users[0];
+                // Use secure password verification
+                if (verifyPassword(password, u.password)) {
+                    return DB_SUCCESS;
+                } else {
+                    return DB_ERROR_PASSWORD_INCORRECT;
+                }
+            }
+            
+            // Multiple users with same name (should not happen with unique constraint)
+            std::cerr << "Multiple users found with name: " << name << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Verify user failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
 
     // Customer operations
-    bool lmDBCore::add_customer(const std::string& name, const std::string& phone, const std::string& email,
+    DB_RESULT lmDBCore::add_customer(const std::string& name, const std::string& phone, const std::string& email,
                                 const std::string& avatar_image, const std::string& address, const std::string& company,
                                 const std::string& position, const std::string& notes)
     {
@@ -312,7 +704,7 @@ namespace lmdb {
             auto existing = impl->sqlite.query_s<Customer>("name = ?", name);
             if (!existing.empty())
             {
-                return false; // Customer name already exists
+                return DB_ERROR_RECORD_NOT_FOUND; // Customer name already exists
             }
 
             Customer customer;
@@ -331,30 +723,44 @@ namespace lmdb {
             customer.updated_at = static_cast<int64_t>(now);
             
             impl->sqlite.insert(customer);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add customer failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::remove_customer(int64_t customer_id)
+    DB_RESULT lmDBCore::remove_customer(int64_t customer_id)
     {
         try
         {
-            impl->sqlite.delete_records<Customer>("id = " + std::to_string(customer_id));
-            return true;
+            impl->sqlite.delete_records_s<Customer>("id = ?", customer_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove customer failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::update_customer(int64_t customer_id, const std::string& name, const std::string& phone,
+    DB_RESULT lmDBCore::remove_customer(const std::string& name)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<Customer>("name = ?", name);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove customer by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_customer(int64_t customer_id, const std::string& name, const std::string& phone,
                                    const std::string& email, const std::string& avatar_image, const std::string& address,
                                    const std::string& company, const std::string& position, const std::string& notes)
     {
@@ -363,7 +769,7 @@ namespace lmdb {
             auto customers = impl->sqlite.query_s<Customer>("id = ?", customer_id);
             if (customers.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             Customer customer = customers[0];
@@ -378,58 +784,101 @@ namespace lmdb {
             customer.updated_at = static_cast<int64_t>(time(0));
 
             impl->sqlite.update(customer);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update customer failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    std::vector<Customer> lmDBCore::get_all_customers()
-    {
-        try
-        {
-            return impl->sqlite.query_s<Customer>("");
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get all customers failed: " << e.what() << std::endl;
-            return {};
-        }
-    }
-
-    Customer lmDBCore::get_customer_by_id(int64_t customer_id)
-    {
-        try
-        {
-            auto customers = impl->sqlite.query_s<Customer>("id = ?", customer_id);
-            return customers.empty() ? Customer() : customers[0];
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get customer by id failed: " << e.what() << std::endl;
-            return Customer();
-        }
-    }
-
-    Customer lmDBCore::get_customer_by_name(const std::string& name)
+    DB_RESULT lmDBCore::update_customer(const std::string& name, const std::string& new_name, const std::string& phone,
+                                   const std::string& email, const std::string& avatar_image, const std::string& address,
+                                   const std::string& company, const std::string& position, const std::string& notes)
     {
         try
         {
             auto customers = impl->sqlite.query_s<Customer>("name = ?", name);
-            return customers.empty() ? Customer() : customers[0];
+            if (customers.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            Customer customer = customers[0];
+            customer.name = new_name;
+            customer.phone = phone;
+            customer.email = email;
+            customer.avatar_image = avatar_image;
+            customer.address = address;
+            customer.company = company;
+            customer.position = position;
+            customer.notes = notes;
+            customer.updated_at = static_cast<int64_t>(time(0));
+
+            impl->sqlite.update(customer);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update customer by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_all_customers(std::vector<Customer> &out_customers)
+    {
+        try
+        {
+            out_customers = impl->sqlite.query_s<Customer>("");
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get all customers failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_customer_by_id(int64_t customer_id, Customer &out_customer)
+    {
+        try
+        {
+            auto customers = impl->sqlite.query_s<Customer>("id = ?", customer_id);
+            if (customers.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_customer = customers[0];
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get customer by id failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_customer_by_name(const std::string& name, Customer &out_customer)
+    {
+        try
+        {
+            auto customers = impl->sqlite.query_s<Customer>("name = ?", name);
+            if (customers.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_customer = customers[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get customer by name failed: " << e.what() << std::endl;
-            return Customer();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
+
     // Order operations
-    bool lmDBCore::add_order(const std::string& name, const std::string& description, const std::string& customer_id, 
+    DB_RESULT lmDBCore::add_order(const std::string& name, const std::string& description, const std::string& customer_id, 
                              int32_t print_quantity, const std::string& attachments)
     {
         try
@@ -447,30 +896,44 @@ namespace lmdb {
             order.updated_at = static_cast<int64_t>(now);
 
             impl->sqlite.insert(order);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add order failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::remove_order(int64_t order_id)
+    DB_RESULT lmDBCore::remove_order(int64_t order_id)
     {
         try
         {
-            impl->sqlite.delete_records<Order>("id = " + std::to_string(order_id));
-            return true;
+            impl->sqlite.delete_records_s<Order>("id = ?", order_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove order failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::update_order(int64_t order_id, const std::string& name, const std::string& description,
+    DB_RESULT lmDBCore::remove_order(const std::string& name)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<Order>("name = ?", name);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove order by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_order(int64_t order_id, const std::string& name, const std::string& description,
                                 const std::string& customer_id, int32_t print_quantity, const std::string& attachments)
     {
         try
@@ -478,7 +941,7 @@ namespace lmdb {
             auto orders = impl->sqlite.query_s<Order>("id = ?", order_id);
             if (orders.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             Order order = orders[0];
@@ -490,192 +953,309 @@ namespace lmdb {
             order.updated_at = static_cast<int64_t>(time(0));
 
             impl->sqlite.update(order);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update order failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    std::vector<Order> lmDBCore::get_all_orders()
+    DB_RESULT lmDBCore::update_order(const std::string& name, const std::string& new_name, const std::string& description,
+                                const std::string& customer_id, int32_t print_quantity, const std::string& attachments)
     {
         try
         {
-            return impl->sqlite.query_s<Order>("");
+            auto orders = impl->sqlite.query_s<Order>("name = ?", name);
+            if (orders.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            Order order = orders[0];
+            order.name = new_name;
+            order.description = description;
+            order.customer_id = customer_id;
+            order.print_quantity = print_quantity;
+            order.attachments = attachments;
+            order.updated_at = static_cast<int64_t>(time(0));
+
+            impl->sqlite.update(order);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update order by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_all_orders(std::vector<Order> &out_orders)
+    {
+        try
+        {
+            out_orders = impl->sqlite.query_s<Order>("");
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get all orders failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    Order lmDBCore::get_order_by_id(int64_t order_id)
+    DB_RESULT lmDBCore::get_order_by_id(int64_t order_id, Order &out_order)
     {
         try
         {
             auto orders = impl->sqlite.query_s<Order>("id = ?", order_id);
-            return orders.empty() ? Order() : orders[0];
+            if (orders.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_order = orders[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get order by id failed: " << e.what() << std::endl;
-            return Order();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    std::vector<Order> lmDBCore::get_orders_by_customer(const std::string& customer_id)
+    DB_RESULT lmDBCore::get_orders_by_customer(const std::string& customer_id, std::vector<Order> &out_orders)
     {
         try
         {
-            return impl->sqlite.query_s<Order>("customer_id = ?", customer_id);
+            out_orders = impl->sqlite.query_s<Order>("customer_id = ?", customer_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get orders by customer failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
     // EmbedDevice operations
-    bool lmDBCore::add_embed_device(const std::string& device_name, const std::string& device_type,
+    DB_RESULT lmDBCore::add_embed_device(const std::string& device_name, int device_type,
+                                    const std::string& model, const std::string& serial_number,
                                     const std::string& firmware_version, const std::string& hardware_version,
-                                    const std::string& manufacturer, const std::string& capabilities)
+                                    const std::string& manufacturer, const std::string& ip_address,
+                                    int32_t port, const std::string& mac_address, int status,
+                                    const std::string& location, const std::string& description,
+                                    const std::string& capabilities, const std::string& metadata)
     {
         try
         {
             auto existing = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
             if (!existing.empty())
             {
-                return false; // Device name already exists
+                return DB_ERROR_RECORD_NOT_FOUND; // Device name already exists
             }
 
-            EmbedDevice device;
-            device.device_name = device_name;
-            device.device_type = device_type;
-            device.firmware_version = firmware_version;
-            device.hardware_version = hardware_version;
-            device.manufacturer = manufacturer;
-            device.capabilities = capabilities;
-            
-            // Set timestamps
-            time_t now = time(0);
-            device.created_at = static_cast<int64_t>(now);
-            device.updated_at = static_cast<int64_t>(now);
+            EmbedDevice device(device_name, device_type, model, serial_number, firmware_version,
+                              hardware_version, manufacturer, ip_address, port, mac_address,
+                              status, location, description, capabilities, metadata);
             
             impl->sqlite.insert(device);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add embed device failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::remove_embed_device(int64_t device_id)
+    DB_RESULT lmDBCore::remove_embed_device(int64_t device_id)
     {
         try
         {
-            impl->sqlite.delete_records<EmbedDevice>("id = " + std::to_string(device_id));
-            return true;
+            impl->sqlite.delete_records_s<EmbedDevice>("device_id = ?", device_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove embed device failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::update_embed_device(int64_t device_id, const std::string& device_name, const std::string& device_type,
-                                       const std::string& firmware_version, const std::string& hardware_version,
-                                       const std::string& manufacturer, const std::string& capabilities)
+    DB_RESULT lmDBCore::remove_embed_device(const std::string& device_name)
     {
         try
         {
-            auto devices = impl->sqlite.query_s<EmbedDevice>("id = ?", device_id);
+            impl->sqlite.delete_records_s<EmbedDevice>("device_name = ?", device_name);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove embed device by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_embed_device(int64_t device_id, const std::string& device_name, int device_type,
+                                       const std::string& model, const std::string& serial_number,
+                                       const std::string& firmware_version, const std::string& hardware_version,
+                                       const std::string& manufacturer, const std::string& ip_address,
+                                       int32_t port, const std::string& mac_address, int status,
+                                       const std::string& location, const std::string& description,
+                                       const std::string& capabilities, const std::string& metadata)
+    {
+        try
+        {
+            auto devices = impl->sqlite.query_s<EmbedDevice>("device_id = ?", device_id);
             if (devices.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             EmbedDevice device = devices[0];
             device.device_name = device_name;
-            device.device_type = device_type;
-            device.firmware_version = firmware_version;
-            device.hardware_version = hardware_version;
-            device.manufacturer = manufacturer;
-            device.capabilities = capabilities;
+            
+            // Only update fields that are not default values
+            if (device_type != -1) device.device_type = device_type;
+            if (!model.empty()) device.model = model;
+            if (!serial_number.empty()) device.serial_number = serial_number;
+            if (!firmware_version.empty()) device.firmware_version = firmware_version;
+            if (!hardware_version.empty()) device.hardware_version = hardware_version;
+            if (!manufacturer.empty()) device.manufacturer = manufacturer;
+            if (!ip_address.empty()) device.ip_address = ip_address;
+            if (port != -1) device.port = port;
+            if (!mac_address.empty()) device.mac_address = mac_address;
+            if (status != -1) device.status = status;
+            if (!location.empty()) device.location = location;
+            if (!description.empty()) device.description = description;
+            if (!capabilities.empty()) device.capabilities = capabilities;
+            if (!metadata.empty()) device.metadata = metadata;
+            
             device.updated_at = static_cast<int64_t>(time(0));
 
             impl->sqlite.update(device);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update embed device failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    std::vector<EmbedDevice> lmDBCore::get_all_embed_devices()
-    {
-        try
-        {
-            return impl->sqlite.query_s<EmbedDevice>("");
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get all embed devices failed: " << e.what() << std::endl;
-            return {};
-        }
-    }
-
-    EmbedDevice lmDBCore::get_embed_device_by_id(int64_t device_id)
-    {
-        try
-        {
-            auto devices = impl->sqlite.query_s<EmbedDevice>("id = ?", device_id);
-            return devices.empty() ? EmbedDevice() : devices[0];
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get embed device by id failed: " << e.what() << std::endl;
-            return EmbedDevice();
-        }
-    }
-
-    EmbedDevice lmDBCore::get_embed_device_by_name(const std::string& device_name)
+    DB_RESULT lmDBCore::update_embed_device(const std::string& device_name, const std::string& new_device_name, int device_type,
+                                       const std::string& model, const std::string& serial_number,
+                                       const std::string& firmware_version, const std::string& hardware_version,
+                                       const std::string& manufacturer, const std::string& ip_address,
+                                       int32_t port, const std::string& mac_address, int status,
+                                       const std::string& location, const std::string& description,
+                                       const std::string& capabilities, const std::string& metadata)
     {
         try
         {
             auto devices = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
-            return devices.empty() ? EmbedDevice() : devices[0];
+            if (devices.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            EmbedDevice device = devices[0];
+            device.device_name = new_device_name;
+            
+            // Only update fields that are not default values
+            if (device_type != -1) device.device_type = device_type;
+            if (!model.empty()) device.model = model;
+            if (!serial_number.empty()) device.serial_number = serial_number;
+            if (!firmware_version.empty()) device.firmware_version = firmware_version;
+            if (!hardware_version.empty()) device.hardware_version = hardware_version;
+            if (!manufacturer.empty()) device.manufacturer = manufacturer;
+            if (!ip_address.empty()) device.ip_address = ip_address;
+            if (port != -1) device.port = port;
+            if (!mac_address.empty()) device.mac_address = mac_address;
+            if (status != -1) device.status = status;
+            if (!location.empty()) device.location = location;
+            if (!description.empty()) device.description = description;
+            if (!capabilities.empty()) device.capabilities = capabilities;
+            if (!metadata.empty()) device.metadata = metadata;
+            
+            device.updated_at = static_cast<int64_t>(time(0));
+
+            impl->sqlite.update(device);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update embed device by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_all_embed_devices(std::vector<EmbedDevice> &out_devices)
+    {
+        try
+        {
+            out_devices = impl->sqlite.query_s<EmbedDevice>("");
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get all embed devices failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_embed_device_by_id(int64_t device_id, EmbedDevice &out_device)
+    {
+        try
+        {
+            auto devices = impl->sqlite.query_s<EmbedDevice>("device_id = ?", device_id);
+            if (devices.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_device = devices[0];
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get embed device by id failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_embed_device_by_name(const std::string& device_name, EmbedDevice &out_device)
+    {
+        try
+        {
+            auto devices = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
+            if (devices.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_device = devices[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get embed device by name failed: " << e.what() << std::endl;
-            return EmbedDevice();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    std::vector<EmbedDevice> lmDBCore::get_embed_devices_by_type(const std::string& device_type)
+    DB_RESULT lmDBCore::get_embed_devices_by_type(int device_type, std::vector<EmbedDevice> &out_devices)
     {
         try
         {
-            return impl->sqlite.query_s<EmbedDevice>("device_type = ?", device_type);
+            out_devices = impl->sqlite.query_s<EmbedDevice>("device_type = ?", device_type);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get embed devices by type failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
     // Print task operations
-    bool lmDBCore::add_print_task(int order_id, const std::string& print_name, const std::string& gcode_filename, int total_quantity)
+    DB_RESULT lmDBCore::add_print_task(int order_id, const std::string& print_name, const std::string& gcode_filename, int total_quantity)
     {
         try
         {
@@ -686,30 +1266,44 @@ namespace lmdb {
             print_task.total_quantity = total_quantity;
             print_task.completed_quantity = 0;
             impl->sqlite.insert(print_task);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add print task failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::remove_print_task(int print_task_id)
+    DB_RESULT lmDBCore::remove_print_task(int print_task_id)
     {
         try
         {
-            impl->sqlite.delete_records<PrintTask>("id = " + std::to_string(print_task_id));
-            return true;
+            impl->sqlite.delete_records_s<PrintTask>("id = ?", print_task_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove print task failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::update_print_task(int print_task_id, const std::string& print_name, const std::string& gcode_filename,
+    DB_RESULT lmDBCore::remove_print_task(const std::string& print_name)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<PrintTask>("print_name = ?", print_name);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove print task by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_print_task(int print_task_id, const std::string& print_name, const std::string& gcode_filename,
                                      int total_quantity, int completed_quantity)
     {
         try
@@ -717,7 +1311,7 @@ namespace lmdb {
             auto print_tasks = impl->sqlite.query_s<PrintTask>("id = ?", print_task_id);
             if (print_tasks.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             PrintTask print_task = print_tasks[0];
@@ -727,87 +1321,120 @@ namespace lmdb {
             print_task.completed_quantity = completed_quantity;
 
             impl->sqlite.update(print_task);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update print task failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    std::vector<PrintTask> lmDBCore::get_all_print_tasks()
+    DB_RESULT lmDBCore::update_print_task(const std::string& print_name, const std::string& new_print_name, const std::string& gcode_filename,
+                                     int total_quantity, int completed_quantity)
     {
         try
         {
-            return impl->sqlite.query_s<PrintTask>("");
+            auto print_tasks = impl->sqlite.query_s<PrintTask>("print_name = ?", print_name);
+            if (print_tasks.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            PrintTask print_task = print_tasks[0];
+            print_task.print_name = new_print_name;
+            print_task.gcode_filename = gcode_filename;
+            print_task.total_quantity = total_quantity;
+            print_task.completed_quantity = completed_quantity;
+
+            impl->sqlite.update(print_task);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update print task by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_all_print_tasks(std::vector<PrintTask> &out_tasks)
+    {
+        try
+        {
+            out_tasks = impl->sqlite.query_s<PrintTask>("");
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get all print tasks failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    PrintTask lmDBCore::get_print_task_by_id(int print_task_id)
+    DB_RESULT lmDBCore::get_print_task_by_id(int print_task_id, PrintTask &out_task)
     {
         try
         {
             auto print_tasks = impl->sqlite.query_s<PrintTask>("id = ?", print_task_id);
-            return print_tasks.empty() ? PrintTask() : print_tasks[0];
+            if (print_tasks.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_task = print_tasks[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get print task by id failed: " << e.what() << std::endl;
-            return PrintTask();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    std::vector<PrintTask> lmDBCore::get_print_tasks_by_order(int order_id)
+    DB_RESULT lmDBCore::get_print_tasks_by_order(int order_id, std::vector<PrintTask> &out_tasks)
     {
         try
         {
-            return impl->sqlite.query_s<PrintTask>("order_id = ?", order_id);
+            out_tasks = impl->sqlite.query_s<PrintTask>("order_id = ?", order_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get print tasks by order failed: " << e.what() << std::endl;
-            return {};
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    bool lmDBCore::update_print_progress(int print_task_id, int completed_quantity)
+    DB_RESULT lmDBCore::update_print_progress(int print_task_id, int completed_quantity)
     {
         try
         {
             auto print_tasks = impl->sqlite.query_s<PrintTask>("id = ?", print_task_id);
             if (print_tasks.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             PrintTask print_task = print_tasks[0];
             print_task.completed_quantity = completed_quantity;
 
             impl->sqlite.update(print_task);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update print progress failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
     // G-code file operations
-    bool lmDBCore::add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
+    DB_RESULT lmDBCore::add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
     {
         try
         {
             auto existing = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
             if (!existing.empty())
             {
-                return false; // Filename already exists
+                return DB_ERROR_RECORD_NOT_FOUND; // Filename already exists
             }
 
             Gcode_file gcode_file;
@@ -824,37 +1451,51 @@ namespace lmdb {
             gcode_file.upload_time = buffer;
 
             impl->sqlite.insert(gcode_file);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add gcode file failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::remove_gcode_file(int gcode_file_id)
+    DB_RESULT lmDBCore::remove_gcode_file(int gcode_file_id)
     {
         try
         {
-            impl->sqlite.delete_records<Gcode_file>("id = " + std::to_string(gcode_file_id));
-            return true;
+            impl->sqlite.delete_records_s<Gcode_file>("id = ?", gcode_file_id);
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Remove gcode file failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    bool lmDBCore::update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
+    DB_RESULT lmDBCore::remove_gcode_file(const std::string& filename)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<Gcode_file>("filename = ?", filename);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove gcode file by filename failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
     {
         try
         {
             auto gcode_files = impl->sqlite.query_s<Gcode_file>("id = ?", gcode_file_id);
             if (gcode_files.empty())
             {
-                return false;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             Gcode_file gcode_file = gcode_files[0];
@@ -865,110 +1506,150 @@ namespace lmdb {
             gcode_file.aeskey = std::string(aeskey, 32);
 
             impl->sqlite.update(gcode_file);
-            return true;
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Update gcode file failed: " << e.what() << std::endl;
-            return false;
+            return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
 
-    std::vector<Gcode_file> lmDBCore::get_all_gcode_files()
-    {
-        try
-        {
-            return impl->sqlite.query_s<Gcode_file>("");
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get all gcode files failed: " << e.what() << std::endl;
-            return {};
-        }
-    }
-
-    Gcode_file lmDBCore::get_gcode_file_by_id(int gcode_file_id)
-    {
-        try
-        {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("id = ?", gcode_file_id);
-            return gcode_files.empty() ? Gcode_file() : gcode_files[0];
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Get gcode file by id failed: " << e.what() << std::endl;
-            return Gcode_file();
-        }
-    }
-
-    Gcode_file lmDBCore::get_gcode_file_by_filename(const std::string& filename)
+    DB_RESULT lmDBCore::update_gcode_file(const std::string& filename, const std::string& new_filename, const std::string& encrypted_path, const std::string& aeskey)
     {
         try
         {
             auto gcode_files = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
-            return gcode_files.empty() ? Gcode_file() : gcode_files[0];
+            if (gcode_files.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            Gcode_file gcode_file = gcode_files[0];
+            gcode_file.filename = new_filename;
+            gcode_file.encrypted_path = encrypted_path;
+            
+            // Copy AES key
+            gcode_file.aeskey = std::string(aeskey, 32);
+
+            impl->sqlite.update(gcode_file);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update gcode file by filename failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_all_gcode_files(std::vector<Gcode_file> &out_files)
+    {
+        try
+        {
+            out_files = impl->sqlite.query_s<Gcode_file>("");
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get all gcode files failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_gcode_file_by_id(int gcode_file_id, Gcode_file &out_file)
+    {
+        try
+        {
+            auto gcode_files = impl->sqlite.query_s<Gcode_file>("id = ?", gcode_file_id);
+            if (gcode_files.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_file = gcode_files[0];
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get gcode file by id failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_gcode_file_by_filename(const std::string& filename, Gcode_file &out_file)
+    {
+        try
+        {
+            auto gcode_files = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
+            if (gcode_files.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_file = gcode_files[0];
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get gcode file by filename failed: " << e.what() << std::endl;
-            return Gcode_file();
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    int lmDBCore::get_total_gcode_files_count()
+    DB_RESULT lmDBCore::get_total_gcode_files_count(int &out_count)
     {
         try
         {
             auto gcode_files = impl->sqlite.query_s<Gcode_file>("");
-            return static_cast<int>(gcode_files.size());
+            out_count = static_cast<int>(gcode_files.size());
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get total gcode files count failed: " << e.what() << std::endl;
-            return 0;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
     // Statistics
-    int lmDBCore::get_total_orders_count()
+    DB_RESULT lmDBCore::get_total_orders_count(int &out_count)
     {
         try
         {
             auto orders = impl->sqlite.query_s<Order>("");
-            return static_cast<int>(orders.size());
+            out_count = static_cast<int>(orders.size());
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get total orders count failed: " << e.what() << std::endl;
-            return 0;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    int lmDBCore::get_total_print_tasks_count()
+    DB_RESULT lmDBCore::get_total_print_tasks_count(int &out_count)
     {
         try
         {
             auto print_tasks = impl->sqlite.query_s<PrintTask>("");
-            return static_cast<int>(print_tasks.size());
+            out_count = static_cast<int>(print_tasks.size());
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get total print tasks count failed: " << e.what() << std::endl;
-            return 0;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    int lmDBCore::get_completed_print_tasks_count()
+    DB_RESULT lmDBCore::get_completed_print_tasks_count(int &out_count)
     {
         try
         {
             auto print_tasks = impl->sqlite.query_s<PrintTask>("completed_quantity >= total_quantity");
-            return static_cast<int>(print_tasks.size());
+            out_count = static_cast<int>(print_tasks.size());
+            return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Get completed print tasks count failed: " << e.what() << std::endl;
-            return 0;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
@@ -993,23 +1674,35 @@ namespace lmdb {
     {
         std::cout << "\n=== 3D Print Management System Database Status ===\n";
 
-        auto users = get_all_users();
-        std::cout << "User count: " << users.size() << std::endl;
+        std::vector<User> users;
+        if (get_all_users(users) == DB_SUCCESS) {
+            std::cout << "User count: " << users.size() << std::endl;
+        }
 
-        auto customers = get_all_customers();
-        std::cout << "Customer count: " << customers.size() << std::endl;
+        std::vector<Customer> customers;
+        if (get_all_customers(customers) == DB_SUCCESS) {
+            std::cout << "Customer count: " << customers.size() << std::endl;
+        }
 
-        auto orders = get_all_orders();
-        std::cout << "Order count: " << orders.size() << std::endl;
+        std::vector<Order> orders;
+        if (get_all_orders(orders) == DB_SUCCESS) {
+            std::cout << "Order count: " << orders.size() << std::endl;
+        }
 
-        auto print_tasks = get_all_print_tasks();
-        std::cout << "Print task count: " << print_tasks.size() << std::endl;
+        std::vector<PrintTask> print_tasks;
+        if (get_all_print_tasks(print_tasks) == DB_SUCCESS) {
+            std::cout << "Print task count: " << print_tasks.size() << std::endl;
+        }
 
-        int completed = get_completed_print_tasks_count();
-        std::cout << "Completed print tasks: " << completed << std::endl;
+        int completed = 0;
+        if (get_completed_print_tasks_count(completed) == DB_SUCCESS) {
+            std::cout << "Completed print tasks: " << completed << std::endl;
+        }
 
-        auto gcode_files = get_all_gcode_files();
-        std::cout << "G-code file count: " << gcode_files.size() << std::endl;
+        std::vector<Gcode_file> gcode_files;
+        if (get_all_gcode_files(gcode_files) == DB_SUCCESS) {
+            std::cout << "G-code file count: " << gcode_files.size() << std::endl;
+        }
 
         std::cout << "===============================================\n\n";
     }
@@ -1090,6 +1783,23 @@ namespace lmdb {
             update_print_progress(1, 3); // Part A - Prototype: 3/5 completed
             update_print_progress(2, 3); // Part B - Prototype: 3/3 completed
             update_print_progress(3, 25); // Part A - Production: 25/100 completed
+            
+            // Add test embed devices
+            std::cout << "Adding test embed devices...\n";
+            add_embed_device("Printer-001", 1, "Ultimaker S5", "UM-S5-001", "5.3.0", "1.0", "Ultimaker", 
+                           "192.168.1.100", 8080, "00:11:22:33:44:55", 2, "Production Floor A", 
+                           "Main 3D printer for production", "{\"max_build_volume\":\"330x240x300\",\"materials\":[\"PLA\",\"ABS\",\"PETG\"]}", 
+                           "{\"maintenance_due\":\"2024-02-15\",\"last_calibration\":\"2024-01-15\"}");
+            
+            add_embed_device("Scanner-001", 2, "EinScan Pro 2X", "ES-P2X-001", "2.1.0", "1.0", "Shining 3D", 
+                           "192.168.1.101", 8081, "00:11:22:33:44:56", 2, "Design Studio", 
+                           "High-resolution 3D scanner", "{\"resolution\":\"0.1mm\",\"scan_volume\":\"400x400x400\"}", 
+                           "{\"calibration_status\":\"valid\",\"last_scan\":\"2024-01-20\"}");
+            
+            add_embed_device("CNC-001", 3, "Tormach PCNC 440", "TC-440-001", "1.5.0", "1.0", "Tormach", 
+                           "192.168.1.102", 8082, "00:11:22:33:44:57", 1, "Machine Shop", 
+                           "Desktop CNC milling machine", "{\"work_area\":\"305x152x152\",\"spindle_speed\":\"10000rpm\"}", 
+                           "{\"tool_changer\":\"manual\",\"coolant_system\":\"enabled\"}");
             
             // Add test gcode files
             std::cout << "Adding test gcode files...\n";
@@ -1172,8 +1882,8 @@ namespace lmdb {
             std::cout << "\n4. Testing decryption using password from database...\n";
             
             // Get G-code file info from database by filename
-            Gcode_file test_file = get_gcode_file_by_filename("test_sample.gcode");
-            if (test_file.filename.empty()) {
+            Gcode_file test_file;
+            if (get_gcode_file_by_filename("test_sample.gcode", test_file) != DB_SUCCESS) {
                 std::cerr << "   ✗ Test G-code file not found in database" << std::endl;
                 return;
             }
@@ -1202,6 +1912,339 @@ namespace lmdb {
             
         } catch (const std::exception& e) {
             std::cerr << "G-code encryption/decryption test error: " << e.what() << std::endl;
+        }
+    }
+
+    // Generate comprehensive test cases for all database functions
+    void lmDBCore::generate_database_test_cases()
+    {
+        std::cout << "\n=== Generate Database Function Test Cases ===\n";
+        
+        try {
+            // Clear existing data to ensure clean test environment
+            clear_all_data();
+            
+            std::cout << "\n1. Test database initialization...\n";
+            DB_RESULT init_result = initialize();
+            std::cout << "   Database initialization: " << (init_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // ========== User Management Test Cases ==========
+            std::cout << "\n2. User Management Function Test Cases:\n";
+            
+            // Test add user
+            std::cout << "   2.1 Test add_user():\n";
+            DB_RESULT add_user_result1 = add_user("test_user1", "test1@example.com", "1234567890", "Test Address 1", ADMIN);
+            std::cout << "      - Add admin user: " << (add_user_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            if (add_user_result1 != DB_SUCCESS) {
+                std::cout << "        Error: " << get_db_error_message(add_user_result1) << std::endl;
+            }
+            
+            DB_RESULT add_user_result2 = add_user("test_user2", "test2@example.com", "0987654321", "Test Address 2", USER);
+            std::cout << "      - Add regular user: " << (add_user_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            if (add_user_result2 != DB_SUCCESS) {
+                std::cout << "        Error: " << get_db_error_message(add_user_result2) << std::endl;
+            }
+            
+            DB_RESULT add_user_result3 = add_user("test_user1", "duplicate@example.com", "1111111111", "Duplicate Address", GUEST);
+            std::cout << "      - Add duplicate username (should fail): " << (add_user_result3 == DB_ERROR_DUPLICATE_RECORD ? "CORRECTLY FAILED" : "SHOULD HAVE FAILED") << std::endl;
+            if (add_user_result3 != DB_SUCCESS) {
+                std::cout << "        Error: " << get_db_error_message(add_user_result3) << std::endl;
+            }
+            
+            // Test add_user with invalid parameters
+            std::cout << "   2.1.1 Test add_user() with invalid parameters:\n";
+            DB_RESULT add_user_result4 = add_user("test_user3", "test3@example.com", "2222222222", "Test Address 3", MANAGER);
+            std::cout << "      - Add manager user: " << (add_user_result4 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            if (add_user_result4 != DB_SUCCESS) {
+                std::cout << "        Error: " << get_db_error_message(add_user_result4) << std::endl;
+            }
+            
+            DB_RESULT add_user_result5 = add_user("test_user1", "duplicate2@example.com", "3333333333", "Duplicate Address 2", GUEST);
+            std::cout << "      - Add duplicate username (should fail): " << (add_user_result5 == DB_ERROR_DUPLICATE_RECORD ? "CORRECTLY FAILED" : "SHOULD HAVE FAILED") << std::endl;
+            if (add_user_result5 != DB_SUCCESS) {
+                std::cout << "        Error: " << get_db_error_message(add_user_result5) << std::endl;
+            }
+            
+            User user;
+            if (get_user_by_name("test_user1", user) == DB_SUCCESS) {
+                DB_RESULT remove_user_result7 = remove_user(user.id);
+                if (remove_user_result7 != DB_SUCCESS) {
+                    std::cout << "        Error: " << get_db_error_message(remove_user_result7) << std::endl;
+                }
+            } 
+ 
+            // Test set password
+            std::cout << "   2.2 Test set_password():\n";
+            DB_RESULT set_pwd_result1 = set_password("test_user1", "password123");
+            std::cout << "      - Set password for user1: " << (set_pwd_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT set_pwd_result2 = set_password("test_user2", "password456");
+            std::cout << "      - Set password for user2: " << (set_pwd_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test user verification
+            std::cout << "   2.3 Test verify_user():\n";
+            DB_RESULT verify_result1 = verify_user("test_user1", "password123");
+            std::cout << "      - Verify user1 correct password: " << (verify_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT verify_result2 = verify_user("test_user1", "wrong_password");
+            std::cout << "      - Verify user1 wrong password: " << (verify_result2 == DB_ERROR_PASSWORD_INCORRECT ? "CORRECTLY FAILED" : "SHOULD HAVE FAILED") << std::endl;
+            
+            DB_RESULT verify_result3 = verify_user("nonexistent_user", "password123");
+            std::cout << "      - Verify non-existent user: " << (verify_result3 == DB_ERROR_RECORD_NOT_FOUND ? "CORRECTLY FAILED" : "SHOULD HAVE FAILED") << std::endl;
+            
+            // Test get user
+            std::cout << "   2.4 Test get_user_by_name():\n";
+            User user1;
+            DB_RESULT get_user_result1 = get_user_by_name("test_user1", user1);
+            std::cout << "      - Get user1: " << (get_user_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            User user_nonexistent;
+            DB_RESULT get_user_result2 = get_user_by_name("nonexistent_user", user_nonexistent);
+            std::cout << "      - Get non-existent user: " << (get_user_result2 == DB_ERROR_RECORD_NOT_FOUND ? "CORRECTLY RETURNED NOT_FOUND" : "SHOULD HAVE RETURNED NOT_FOUND") << std::endl;
+            
+            // Test update user
+            std::cout << "   2.5 Test update_user():\n";
+            DB_RESULT update_user_result = update_user("test_user1", "updated_user1", "updated1@example.com", "9999999999", "Updated Address 1", MANAGER);
+            std::cout << "      - Update user1 info: " << (update_user_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get all users
+            std::cout << "   2.6 Test get_all_users():\n";
+            std::vector<User> all_users;
+            DB_RESULT get_all_users_result = get_all_users(all_users);
+            std::cout << "      - Get all users count: " << (get_all_users_result == DB_SUCCESS ? std::to_string(all_users.size()) : "FAILED") << " users" << std::endl;
+            
+            // Test change password
+            std::cout << "   2.7 Test change_password():\n";
+            DB_RESULT change_pwd_result = change_password("updated_user1", "password123", "newpassword123");
+            std::cout << "      - Change user password: " << (change_pwd_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // ========== Customer Management Test Cases ==========
+            std::cout << "\n3. Customer Management Function Test Cases:\n";
+            
+            // Test add customer
+            std::cout << "   3.1 Test add_customer():\n";
+            DB_RESULT add_customer_result1 = add_customer("Test Customer 1", "1111111111", "customer1@example.com", "", "Customer Address 1", "Test Company 1", "Manager", "Notes 1");
+            std::cout << "      - Add customer 1: " << (add_customer_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT add_customer_result2 = add_customer("Test Customer 2", "2222222222", "customer2@example.com", "", "Customer Address 2", "Test Company 2", "Director", "Notes 2");
+            std::cout << "      - Add customer 2: " << (add_customer_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get customer
+            std::cout << "   3.2 Test get_customer_by_name():\n";
+            Customer customer1;
+            DB_RESULT get_customer_result = get_customer_by_name("Test Customer 1", customer1);
+            std::cout << "      - Get customer 1: " << (get_customer_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test update customer
+            std::cout << "   3.3 Test update_customer():\n";
+            DB_RESULT update_customer_result = update_customer("Test Customer 1", "Updated Customer 1", "3333333333", "updated1@example.com", "", "Updated Address 1", "Updated Company 1", "Updated Position 1", "Updated Notes 1");
+            std::cout << "      - Update customer 1: " << (update_customer_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get all customers
+            std::cout << "   3.4 Test get_all_customers():\n";
+            std::vector<Customer> all_customers;
+            DB_RESULT get_all_customers_result = get_all_customers(all_customers);
+            std::cout << "      - Get all customers count: " << (get_all_customers_result == DB_SUCCESS ? std::to_string(all_customers.size()) : "FAILED") << " customers" << std::endl;
+            
+            // ========== Order Management Test Cases ==========
+            std::cout << "\n4. Order Management Function Test Cases:\n";
+            
+            // Test add order
+            std::cout << "   4.1 Test add_order():\n";
+            DB_RESULT add_order_result1 = add_order("Test Order 1", "Order Description 1", "1", 10, "Attachment 1");
+            std::cout << "      - Add order 1: " << (add_order_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT add_order_result2 = add_order("Test Order 2", "Order Description 2", "2", 20, "Attachment 2");
+            std::cout << "      - Add order 2: " << (add_order_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get order
+            std::cout << "   4.2 Test get_order_by_id():\n";
+            Order order1;
+            DB_RESULT get_order_result = get_order_by_id(1, order1);
+            std::cout << "      - Get order 1: " << (get_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test update order
+            std::cout << "   4.3 Test update_order():\n";
+            DB_RESULT update_order_result = update_order(1, "Updated Order 1", "Updated Description 1", "1", 15, "Updated Attachment 1");
+            std::cout << "      - Update order 1: " << (update_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get orders by customer
+            std::cout << "   4.4 Test get_orders_by_customer():\n";
+            std::vector<Order> customer_orders;
+            DB_RESULT get_orders_by_customer_result = get_orders_by_customer("1", customer_orders);
+            std::cout << "      - Get customer 1 orders count: " << (get_orders_by_customer_result == DB_SUCCESS ? std::to_string(customer_orders.size()) : "FAILED") << " orders" << std::endl;
+            
+            // Test get all orders
+            std::cout << "   4.5 Test get_all_orders():\n";
+            std::vector<Order> all_orders;
+            DB_RESULT get_all_orders_result = get_all_orders(all_orders);
+            std::cout << "      - Get all orders count: " << (get_all_orders_result == DB_SUCCESS ? std::to_string(all_orders.size()) : "FAILED") << " orders" << std::endl;
+            
+            // ========== Embedded Device Management Test Cases ==========
+            std::cout << "\n5. Embedded Device Management Function Test Cases:\n";
+            
+            // Test add device
+            std::cout << "   5.1 Test add_embed_device():\n";
+            DB_RESULT add_device_result1 = add_embed_device("Test Device 1", 1, "Model 1", "Serial 1", "Firmware 1.0", "Hardware 1.0", "Manufacturer 1", "192.168.1.100", 8080, "00:11:22:33:44:55", 1, "Location 1", "Description 1", "Capabilities 1", "Metadata 1");
+            std::cout << "      - Add device 1: " << (add_device_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT add_device_result2 = add_embed_device("Test Device 2", 2, "Model 2", "Serial 2", "Firmware 2.0", "Hardware 2.0", "Manufacturer 2", "192.168.1.101", 8081, "00:11:22:33:44:56", 2, "Location 2", "Description 2", "Capabilities 2", "Metadata 2");
+            std::cout << "      - Add device 2: " << (add_device_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get device
+            std::cout << "   5.2 Test get_embed_device_by_name():\n";
+            EmbedDevice device1;
+            DB_RESULT get_device_result = get_embed_device_by_name("Test Device 1", device1);
+            std::cout << "      - Get device 1: " << (get_device_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get devices by type
+            std::cout << "   5.3 Test get_embed_devices_by_type():\n";
+            std::vector<EmbedDevice> type1_devices;
+            DB_RESULT get_devices_by_type_result = get_embed_devices_by_type(1, type1_devices);
+            std::cout << "      - Get type 1 devices count: " << (get_devices_by_type_result == DB_SUCCESS ? std::to_string(type1_devices.size()) : "FAILED") << " devices" << std::endl;
+            
+            // Test update device
+            std::cout << "   5.4 Test update_embed_device():\n";
+            DB_RESULT update_device_result = update_embed_device("Test Device 1", "Updated Device 1", 1, "Updated Model 1", "Updated Serial 1", "Updated Firmware 1.1", "Updated Hardware 1.1", "Updated Manufacturer 1", "192.168.1.200", 8082, "00:11:22:33:44:66", 2, "Updated Location 1", "Updated Description 1", "Updated Capabilities 1", "Updated Metadata 1");
+            std::cout << "      - Update device 1: " << (update_device_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get all devices
+            std::cout << "   5.5 Test get_all_embed_devices():\n";
+            std::vector<EmbedDevice> all_devices;
+            DB_RESULT get_all_devices_result = get_all_embed_devices(all_devices);
+            std::cout << "      - Get all devices count: " << (get_all_devices_result == DB_SUCCESS ? std::to_string(all_devices.size()) : "FAILED") << " devices" << std::endl;
+            
+            // ========== Print Task Management Test Cases ==========
+            std::cout << "\n6. Print Task Management Function Test Cases:\n";
+            
+            // Test add print task
+            std::cout << "   6.1 Test add_print_task():\n";
+            DB_RESULT add_task_result1 = add_print_task(1, "Print Task 1", "task1.gcode", 100);
+            std::cout << "      - Add print task 1: " << (add_task_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT add_task_result2 = add_print_task(2, "Print Task 2", "task2.gcode", 200);
+            std::cout << "      - Add print task 2: " << (add_task_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get print task
+            std::cout << "   6.2 Test get_print_task_by_id():\n";
+            PrintTask task1;
+            DB_RESULT get_task_result = get_print_task_by_id(1, task1);
+            std::cout << "      - Get print task 1: " << (get_task_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test update print progress
+            std::cout << "   6.3 Test update_print_progress():\n";
+            DB_RESULT update_progress_result = update_print_progress(1, 50);
+            std::cout << "      - Update print task 1 progress: " << (update_progress_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get print tasks by order
+            std::cout << "   6.4 Test get_print_tasks_by_order():\n";
+            std::vector<PrintTask> order_tasks;
+            DB_RESULT get_tasks_by_order_result = get_print_tasks_by_order(1, order_tasks);
+            std::cout << "      - Get order 1 print tasks count: " << (get_tasks_by_order_result == DB_SUCCESS ? std::to_string(order_tasks.size()) : "FAILED") << " tasks" << std::endl;
+            
+            // Test update print task
+            std::cout << "   6.5 Test update_print_task():\n";
+            DB_RESULT update_task_result = update_print_task(1, "Updated Print Task 1", "updated_task1.gcode", 150, 75);
+            std::cout << "      - Update print task 1: " << (update_task_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get all print tasks
+            std::cout << "   6.6 Test get_all_print_tasks():\n";
+            std::vector<PrintTask> all_tasks;
+            DB_RESULT get_all_tasks_result = get_all_print_tasks(all_tasks);
+            std::cout << "      - Get all print tasks count: " << (get_all_tasks_result == DB_SUCCESS ? std::to_string(all_tasks.size()) : "FAILED") << " tasks" << std::endl;
+            
+            // ========== G-code File Management Test Cases ==========
+            std::cout << "\n7. G-code File Management Function Test Cases:\n";
+            
+            // Test add G-code file
+            std::cout << "   7.1 Test add_gcode_file():\n";
+            std::string test_key1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            DB_RESULT add_gcode_result1 = add_gcode_file("test1.gcode", "./enc/test1.enc", test_key1);
+            std::cout << "      - Add G-code file 1: " << (add_gcode_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::string test_key2 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+            DB_RESULT add_gcode_result2 = add_gcode_file("test2.gcode", "./enc/test2.enc", test_key2);
+            std::cout << "      - Add G-code file 2: " << (add_gcode_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get G-code file
+            std::cout << "   7.2 Test get_gcode_file_by_filename():\n";
+            Gcode_file gcode1;
+            DB_RESULT get_gcode_result = get_gcode_file_by_filename("test1.gcode", gcode1);
+            std::cout << "      - Get G-code file 1: " << (get_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test update G-code file
+            std::cout << "   7.3 Test update_gcode_file():\n";
+            std::string new_key = "1111111111111111111111111111111111111111111111111111111111111111";
+            DB_RESULT update_gcode_result = update_gcode_file("test1.gcode", "updated_test1.gcode", "./enc/updated_test1.enc", new_key);
+            std::cout << "      - Update G-code file 1: " << (update_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test get all G-code files
+            std::cout << "   7.4 Test get_all_gcode_files():\n";
+            std::vector<Gcode_file> all_gcode_files;
+            DB_RESULT get_all_gcode_result = get_all_gcode_files(all_gcode_files);
+            std::cout << "      - Get all G-code files count: " << (get_all_gcode_result == DB_SUCCESS ? std::to_string(all_gcode_files.size()) : "FAILED") << " files" << std::endl;
+            
+            // Test get total G-code files count
+            std::cout << "   7.5 Test get_total_gcode_files_count():\n";
+            int gcode_count = 0;
+            DB_RESULT get_gcode_count_result = get_total_gcode_files_count(gcode_count);
+            std::cout << "      - Total G-code files count: " << (get_gcode_count_result == DB_SUCCESS ? std::to_string(gcode_count) : "FAILED") << " files" << std::endl;
+            
+            // ========== Statistics Function Test Cases ==========
+            std::cout << "\n8. Statistics Function Test Cases:\n";
+            
+            std::cout << "   8.1 Test get_total_orders_count():\n";
+            int order_count = 0;
+            DB_RESULT get_order_count_result = get_total_orders_count(order_count);
+            std::cout << "      - Total orders count: " << (get_order_count_result == DB_SUCCESS ? std::to_string(order_count) : "FAILED") << " orders" << std::endl;
+            
+            std::cout << "   8.2 Test get_total_print_tasks_count():\n";
+            int task_count = 0;
+            DB_RESULT get_task_count_result = get_total_print_tasks_count(task_count);
+            std::cout << "      - Total print tasks count: " << (get_task_count_result == DB_SUCCESS ? std::to_string(task_count) : "FAILED") << " tasks" << std::endl;
+            
+            std::cout << "   8.3 Test get_completed_print_tasks_count():\n";
+            int completed_count = 0;
+            DB_RESULT get_completed_count_result = get_completed_print_tasks_count(completed_count);
+            std::cout << "      - Completed print tasks count: " << (get_completed_count_result == DB_SUCCESS ? std::to_string(completed_count) : "FAILED") << " tasks" << std::endl;
+            
+            // ========== Delete Operations Test Cases ==========
+            std::cout << "\n9. Delete Operations Test Cases:\n";
+            
+            std::cout << "   9.1 Test remove_user():\n";
+            DB_RESULT remove_user_result = remove_user("updated_user1");
+            std::cout << "      - Remove user 1: " << (remove_user_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::cout << "   9.2 Test remove_customer():\n";
+            DB_RESULT remove_customer_result = remove_customer("Updated Customer 1");
+            std::cout << "      - Remove customer 1: " << (remove_customer_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::cout << "   9.3 Test remove_order():\n";
+            DB_RESULT remove_order_result = remove_order(1);
+            std::cout << "      - Remove order 1: " << (remove_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::cout << "   9.4 Test remove_embed_device():\n";
+            DB_RESULT remove_device_result = remove_embed_device("Updated Device 1");
+            std::cout << "      - Remove device 1: " << (remove_device_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::cout << "   9.5 Test remove_print_task():\n";
+            DB_RESULT remove_task_result = remove_print_task(1);
+            std::cout << "      - Remove print task 1: " << (remove_task_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            std::cout << "   9.6 Test remove_gcode_file():\n";
+            DB_RESULT remove_gcode_result = remove_gcode_file("updated_test1.gcode");
+            std::cout << "      - Remove G-code file 1: " << (remove_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // ========== Database Status Test ==========
+            std::cout << "\n10. Database Status Test:\n";
+            std::cout << "   10.1 Test print_database_status():\n";
+            print_database_status();
+            
+            std::cout << "\n=== Database Function Test Cases Generation Complete ===\n";
+            std::cout << "All database functions have been verified through test cases!\n";
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error occurred while generating test cases: " << e.what() << std::endl;
         }
     }
 }

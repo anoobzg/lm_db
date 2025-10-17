@@ -15,6 +15,29 @@ enum  USER_ROLE
     ADMIN = 4
 };
 
+
+
+// Database operation result codes
+enum DB_RESULT
+{
+    DB_SUCCESS = 0,                    // Operation successful
+    DB_ERROR_DATABASE_CONNECTION = 1,  // Database connection error
+    DB_ERROR_SQL_EXECUTION = 2,        // SQL execution error
+    DB_ERROR_RECORD_NOT_FOUND = 3,     // Record not found
+    DB_ERROR_DUPLICATE_RECORD = 4,     // Duplicate record (unique constraint violation)
+    DB_ERROR_INVALID_PARAMETER = 5,    // Invalid parameter
+    DB_ERROR_PERMISSION_DENIED = 6,    // Permission denied
+    DB_ERROR_FOREIGN_KEY_CONSTRAINT = 7, // Foreign key constraint violation
+    DB_ERROR_DATABASE_LOCKED = 8,      // Database is locked
+    DB_ERROR_DISK_FULL = 9,            // Disk full
+    DB_ERROR_OLD_PASSWORD_INCORRECT = 10, // Old password is incorrect (for change_password)
+    DB_ERROR_PASSWORD_INCORRECT = 11,  // Password is incorrect (for verify_user)
+    DB_ERROR_UNKNOWN = 99              // Unknown error
+};
+
+// Helper function to get error message from error code
+const char* get_db_error_message(DB_RESULT error_code);
+
 // User data structure (matches user_service.proto)
 struct User
 {
@@ -94,27 +117,64 @@ struct Order
     }
 };
 
-// EmbedDevice data structure (matches embeddevice::DeviceInfo)
+// EmbedDevice data structure (matches embed_device_service.proto Device message)
 struct EmbedDevice
 {
-    int64_t id;                    // Auto-increment primary key
+    int64_t device_id;             // Auto-increment primary key (database internal)
     std::string device_name;       // Device name
-    std::string device_type;       // Device type
+    int device_type;               // Device type (DeviceType enum value)
+    
+    // Hardware information
+    std::string model;             // Device model
+    std::string serial_number;     // Serial number
     std::string firmware_version;  // Firmware version
     std::string hardware_version;  // Hardware version
     std::string manufacturer;      // Manufacturer
-    std::string capabilities;      // JSON string of capabilities map
+    
+    // Network information
+    std::string ip_address;        // IP address
+    int32_t port;                  // Port number
+    std::string mac_address;       // MAC address
+    
+    // Status information
+    int status;                    // Current device status (DeviceStatus enum value)
+    
+    // Location and description
+    std::string location;          // Physical location
+    std::string description;       // Device description
+    
+    // Timestamps
+    int64_t last_seen;             // Last seen timestamp (Unix time in seconds)
     int64_t created_at;            // Creation timestamp
-    int64_t updated_at;            // Update timestamp
+    int64_t updated_at;            // Last update timestamp
+    
+    // Session information
+    std::string session_id;        // Current session ID (if connected)
+    
+    // Extended attributes (stored as JSON strings)
+    std::string capabilities;      // Device capabilities (JSON string of key-value pairs)
+    std::string metadata;          // Additional metadata (JSON string of key-value pairs)
 
     EmbedDevice() = default;
-    EmbedDevice(const std::string &name, const std::string &type, const std::string &manufacturer = "")
-        : device_name(name), device_type(type), manufacturer(manufacturer) {
+    EmbedDevice(const std::string &device_name, int device_type = 0,
+                const std::string &model = "", const std::string &serial_number = "",
+                const std::string &firmware_version = "", const std::string &hardware_version = "",
+                const std::string &manufacturer = "", const std::string &ip_address = "",
+                int32_t port = 0, const std::string &mac_address = "", int status = 0,
+                const std::string &location = "", const std::string &description = "",
+                const std::string &capabilities = "", const std::string &metadata = "")
+        : device_name(device_name), device_type(device_type), model(model),
+          serial_number(serial_number), firmware_version(firmware_version),
+          hardware_version(hardware_version), manufacturer(manufacturer),
+          ip_address(ip_address), port(port), mac_address(mac_address),
+          status(status), location(location), description(description),
+          capabilities(capabilities), metadata(metadata) {
         // Set default timestamps
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
         created_at = static_cast<int64_t>(time_t);
         updated_at = created_at;
+        last_seen = created_at;
     }
 };
 
@@ -151,97 +211,143 @@ namespace lmdb
     class LM_DB_API lmDBCore
     {
     public:
-        lmDBCore(const std::string &db_path);
+        lmDBCore(const std::string &db_name);
         ~lmDBCore();
 
         // Initialize database with all tables
-        bool initialize();
+        DB_RESULT initialize();
 
         // User operations (matches user_service.proto)
-        bool add_user(const std::string &name, const std::string &email,
-                      const std::string &phone = "", const std::string &address = "", int role = 1);
-        bool remove_user(int64_t id);
-        bool update_user(int64_t id, const std::string &name, const std::string &email,
+        DB_RESULT add_user(const std::string &name, const std::string &email,
+                          const std::string &phone = "", const std::string &address = "", int role = 1);
+        DB_RESULT remove_user(int64_t id);
+        DB_RESULT remove_user(const std::string &name);
+        DB_RESULT update_user(int64_t id, const std::string &name, const std::string &email,
                          const std::string &phone = "", const std::string &address = "", int role = -1);
-        bool set_password(int64_t id, const std::string &new_password);
-        bool set_password(const std::string &name, const std::string &new_password);
-        bool get_password(int64_t id, std::string &out_password);
-        User get_user_by_id(int64_t id);
-        User get_user_by_name(const std::string &name);
-        std::vector<User> get_all_users();
-        bool verify_user(const std::string &name, const std::string &password);
+        DB_RESULT update_user(const std::string &name, const std::string &new_name, const std::string &email,
+                         const std::string &phone = "", const std::string &address = "", int role = -1);
+        DB_RESULT set_password(int64_t id, const std::string &new_password);
+        DB_RESULT set_password(const std::string &name, const std::string &new_password);
+        DB_RESULT change_password(int64_t id, const std::string &old_password, const std::string &new_password);
+        DB_RESULT change_password(const std::string &name, const std::string &old_password, const std::string &new_password);
+        DB_RESULT get_password(int64_t id, std::string &out_password);
+        DB_RESULT get_user_by_id(int64_t id, User &out_user);
+        DB_RESULT get_user_by_name(const std::string &name, User &out_user);
+        DB_RESULT get_all_users(std::vector<User> &out_users);
+        DB_RESULT verify_user(const std::string &name, const std::string &password);
+
 
         // Customer operations
-        bool add_customer(const std::string &name, const std::string &phone, const std::string &email = "",
+        DB_RESULT add_customer(const std::string &name, const std::string &phone, const std::string &email = "",
                           const std::string &avatar_image = "", const std::string &address = "", const std::string &company = "",
                           const std::string &position = "", const std::string &notes = "");
-        bool remove_customer(int64_t customer_id);
-        bool update_customer(int64_t customer_id, const std::string &name, const std::string &phone,
+        DB_RESULT remove_customer(int64_t customer_id);
+        DB_RESULT remove_customer(const std::string &name);
+        DB_RESULT update_customer(int64_t customer_id, const std::string &name, const std::string &phone,
                              const std::string &email = "", const std::string &avatar_image = "", const std::string &address = "",
                              const std::string &company = "", const std::string &position = "", const std::string &notes = "");
-        std::vector<Customer> get_all_customers();
-        Customer get_customer_by_id(int64_t customer_id);
-        Customer get_customer_by_name(const std::string &name);
+        DB_RESULT update_customer(const std::string &name, const std::string &new_name, const std::string &phone,
+                             const std::string &email = "", const std::string &avatar_image = "", const std::string &address = "",
+                             const std::string &company = "", const std::string &position = "", const std::string &notes = "");
+        DB_RESULT get_all_customers(std::vector<Customer> &out_customers);
+        DB_RESULT get_customer_by_id(int64_t customer_id, Customer &out_customer);
+        DB_RESULT get_customer_by_name(const std::string &name, Customer &out_customer);
+
 
         // Order operations
-        bool add_order(const std::string &name, const std::string &description, const std::string &customer_id,
+        DB_RESULT add_order(const std::string &name, const std::string &description, const std::string &customer_id,
                        int32_t print_quantity = 1, const std::string &attachments = "");
-        bool remove_order(int64_t order_id);
-        bool update_order(int64_t order_id, const std::string &name, const std::string &description,
+        DB_RESULT remove_order(int64_t order_id);
+        DB_RESULT remove_order(const std::string &name);
+        DB_RESULT update_order(int64_t order_id, const std::string &name, const std::string &description,
                           const std::string &customer_id, int32_t print_quantity, const std::string &attachments);
-        std::vector<Order> get_all_orders();
-        Order get_order_by_id(int64_t order_id);
-        std::vector<Order> get_orders_by_customer(const std::string &customer_id);
+        DB_RESULT update_order(const std::string &name, const std::string &new_name, const std::string &description,
+                          const std::string &customer_id, int32_t print_quantity, const std::string &attachments);
+        DB_RESULT get_all_orders(std::vector<Order> &out_orders);
+        DB_RESULT get_order_by_id(int64_t order_id, Order &out_order);
+        DB_RESULT get_orders_by_customer(const std::string &customer_id, std::vector<Order> &out_orders);
+
 
         // EmbedDevice operations
-        bool add_embed_device(const std::string &device_name, const std::string &device_type,
+        DB_RESULT add_embed_device(const std::string &device_name, int device_type = 0,
+                              const std::string &model = "", const std::string &serial_number = "",
                               const std::string &firmware_version = "", const std::string &hardware_version = "",
-                              const std::string &manufacturer = "", const std::string &capabilities = "");
-        bool remove_embed_device(int64_t device_id);
-        bool update_embed_device(int64_t device_id, const std::string &device_name, const std::string &device_type,
-                                 const std::string &firmware_version, const std::string &hardware_version,
-                                 const std::string &manufacturer, const std::string &capabilities);
-        std::vector<EmbedDevice> get_all_embed_devices();
-        EmbedDevice get_embed_device_by_id(int64_t device_id);
-        EmbedDevice get_embed_device_by_name(const std::string &device_name);
-        std::vector<EmbedDevice> get_embed_devices_by_type(const std::string &device_type);
+                              const std::string &manufacturer = "", const std::string &ip_address = "",
+                              int32_t port = 0, const std::string &mac_address = "", int status = 0,
+                              const std::string &location = "", const std::string &description = "",
+                              const std::string &capabilities = "", const std::string &metadata = "");
+        DB_RESULT remove_embed_device(int64_t device_id);
+        DB_RESULT remove_embed_device(const std::string &device_name);
+        DB_RESULT update_embed_device(int64_t device_id, const std::string &device_name, int device_type = -1,
+                                 const std::string &model = "", const std::string &serial_number = "",
+                                 const std::string &firmware_version = "", const std::string &hardware_version = "",
+                                 const std::string &manufacturer = "", const std::string &ip_address = "",
+                                 int32_t port = -1, const std::string &mac_address = "", int status = -1,
+                                 const std::string &location = "", const std::string &description = "",
+                                 const std::string &capabilities = "", const std::string &metadata = "");
+        DB_RESULT update_embed_device(const std::string &device_name, const std::string &new_device_name, int device_type = -1,
+                                 const std::string &model = "", const std::string &serial_number = "",
+                                 const std::string &firmware_version = "", const std::string &hardware_version = "",
+                                 const std::string &manufacturer = "", const std::string &ip_address = "",
+                                 int32_t port = -1, const std::string &mac_address = "", int status = -1,
+                                 const std::string &location = "", const std::string &description = "",
+                                 const std::string &capabilities = "", const std::string &metadata = "");
+        DB_RESULT get_all_embed_devices(std::vector<EmbedDevice> &out_devices);
+        DB_RESULT get_embed_device_by_id(int64_t device_id, EmbedDevice &out_device);
+        DB_RESULT get_embed_device_by_name(const std::string &device_name, EmbedDevice &out_device);
+        DB_RESULT get_embed_devices_by_type(int device_type, std::vector<EmbedDevice> &out_devices);
+
 
         // Print task operations
-        bool add_print_task(int order_id, const std::string &print_name, const std::string &gcode_filename, int total_quantity);
-        bool remove_print_task(int print_task_id);
-        bool update_print_task(int print_task_id, const std::string &print_name, const std::string &gcode_filename,
+        DB_RESULT add_print_task(int order_id, const std::string &print_name, const std::string &gcode_filename, int total_quantity);
+        DB_RESULT remove_print_task(int print_task_id);
+        DB_RESULT remove_print_task(const std::string &print_name);
+        DB_RESULT update_print_task(int print_task_id, const std::string &print_name, const std::string &gcode_filename,
                                int total_quantity, int completed_quantity);
-        std::vector<PrintTask> get_all_print_tasks();
-        PrintTask get_print_task_by_id(int print_task_id);
-        std::vector<PrintTask> get_print_tasks_by_order(int order_id);
-        bool update_print_progress(int print_task_id, int completed_quantity);
+        DB_RESULT update_print_task(const std::string &print_name, const std::string &new_print_name, const std::string &gcode_filename,
+                               int total_quantity, int completed_quantity);
+        DB_RESULT get_all_print_tasks(std::vector<PrintTask> &out_tasks);
+        DB_RESULT get_print_task_by_id(int print_task_id, PrintTask &out_task);
+        DB_RESULT get_print_tasks_by_order(int order_id, std::vector<PrintTask> &out_tasks);
+        DB_RESULT update_print_progress(int print_task_id, int completed_quantity);
+
 
         // G-code file operations
-        bool add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
-        bool remove_gcode_file(int gcode_file_id);
-        bool update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
-        std::vector<Gcode_file> get_all_gcode_files();
-        Gcode_file get_gcode_file_by_id(int gcode_file_id);
-        Gcode_file get_gcode_file_by_filename(const std::string& filename);
-        int get_total_gcode_files_count();
+        DB_RESULT add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
+        DB_RESULT remove_gcode_file(int gcode_file_id);
+        DB_RESULT remove_gcode_file(const std::string& filename);
+        DB_RESULT update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
+        DB_RESULT update_gcode_file(const std::string& filename, const std::string& new_filename, const std::string& encrypted_path, const std::string& aeskey);
+        DB_RESULT get_all_gcode_files(std::vector<Gcode_file> &out_files);
+        DB_RESULT get_gcode_file_by_id(int gcode_file_id, Gcode_file &out_file);
+        DB_RESULT get_gcode_file_by_filename(const std::string& filename, Gcode_file &out_file);
+        DB_RESULT get_total_gcode_files_count(int &out_count);
+
 
         // Statistics
-        int get_total_orders_count();
-        int get_total_print_tasks_count();
-        int get_completed_print_tasks_count();
+        DB_RESULT get_total_orders_count(int &out_count);
+        DB_RESULT get_total_print_tasks_count(int &out_count);
+        DB_RESULT get_completed_print_tasks_count(int &out_count);
 
         // Database maintenance
         void clear_all_data();
         void print_database_status();
         void print(const std::string &query = "");
+
+        const std::string& get_database_path() const;
+
         
         // Test functions
         void populate_test_data();
         
         // G-code encryption/decryption test functions
         void test_gcode_encryption_decryption();
+        
+        // Generate comprehensive test cases for all database functions
+        void generate_database_test_cases();
 
     protected:
         lmDBCoreImpl *impl;
+        std::string db_path_;
     };
 }
