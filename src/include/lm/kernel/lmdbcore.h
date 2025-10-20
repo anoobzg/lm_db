@@ -102,12 +102,12 @@ struct Order
     std::string description;       // Order description
     std::string attachments;       // JSON string of attachments array
     int32_t print_quantity;        // Print quantity
-    std::string customer_id;       // Associated customer ID (string)
+    int64_t customer_id;           // Associated customer ID (int64_t)
     int64_t created_at;            // Creation timestamp
     int64_t updated_at;            // Update timestamp
 
     Order() = default;
-    Order(const std::string &name, const std::string &desc = "", const std::string &customer_id = "", int32_t quantity = 1)
+    Order(const std::string &name, const std::string &desc = "", int64_t customer_id = 0, int32_t quantity = 1)
         : name(name), description(desc), customer_id(customer_id), print_quantity(quantity) {
         // Set default timestamps
         auto now = std::chrono::system_clock::now();
@@ -218,18 +218,18 @@ namespace lmdb
         DB_RESULT initialize();
 
         // User operations (matches user_service.proto)
-        DB_RESULT add_user(const std::string &name, const std::string &email,
+        DB_RESULT add_user(const std::string &name, const std::string &email, const std::string &password,
                           const std::string &phone = "", const std::string &address = "", int role = 1);
+        DB_RESULT add_user(User &user);  // 新增：传入User结构体的接口
         DB_RESULT remove_user(int64_t id);
         DB_RESULT remove_user(const std::string &name);
         DB_RESULT update_user(int64_t id, const std::string &name, const std::string &email,
                          const std::string &phone = "", const std::string &address = "", int role = -1);
         DB_RESULT update_user(const std::string &name, const std::string &new_name, const std::string &email,
                          const std::string &phone = "", const std::string &address = "", int role = -1);
+        DB_RESULT update_user(const User &user);  // 新增：传入User结构体的更新接口
         DB_RESULT set_password(int64_t id, const std::string &new_password);
         DB_RESULT set_password(const std::string &name, const std::string &new_password);
-        DB_RESULT change_password(int64_t id, const std::string &old_password, const std::string &new_password);
-        DB_RESULT change_password(const std::string &name, const std::string &old_password, const std::string &new_password);
         DB_RESULT get_password(int64_t id, std::string &out_password);
         DB_RESULT get_user_by_id(int64_t id, User &out_user);
         DB_RESULT get_user_by_name(const std::string &name, User &out_user);
@@ -241,6 +241,7 @@ namespace lmdb
         DB_RESULT add_customer(const std::string &name, const std::string &phone, const std::string &email = "",
                           const std::string &avatar_image = "", const std::string &address = "", const std::string &company = "",
                           const std::string &position = "", const std::string &notes = "");
+        DB_RESULT add_customer(Customer &customer);  // 新增：传入Customer结构体的接口
         DB_RESULT remove_customer(int64_t customer_id);
         DB_RESULT remove_customer(const std::string &name);
         DB_RESULT update_customer(int64_t customer_id, const std::string &name, const std::string &phone,
@@ -249,23 +250,26 @@ namespace lmdb
         DB_RESULT update_customer(const std::string &name, const std::string &new_name, const std::string &phone,
                              const std::string &email = "", const std::string &avatar_image = "", const std::string &address = "",
                              const std::string &company = "", const std::string &position = "", const std::string &notes = "");
+        DB_RESULT update_customer(const Customer &customer);  // 新增：传入Customer结构体的更新接口
         DB_RESULT get_all_customers(std::vector<Customer> &out_customers);
         DB_RESULT get_customer_by_id(int64_t customer_id, Customer &out_customer);
         DB_RESULT get_customer_by_name(const std::string &name, Customer &out_customer);
 
 
         // Order operations
-        DB_RESULT add_order(const std::string &name, const std::string &description, const std::string &customer_id,
+        DB_RESULT add_order(const std::string &name, const std::string &description, int64_t customer_id,
                        int32_t print_quantity = 1, const std::string &attachments = "");
+        DB_RESULT add_order(Order &order);  // 新增：传入Order结构体的接口
         DB_RESULT remove_order(int64_t order_id);
         DB_RESULT remove_order(const std::string &name);
         DB_RESULT update_order(int64_t order_id, const std::string &name, const std::string &description,
-                          const std::string &customer_id, int32_t print_quantity, const std::string &attachments);
+                          int64_t customer_id, int32_t print_quantity, const std::string &attachments);
         DB_RESULT update_order(const std::string &name, const std::string &new_name, const std::string &description,
-                          const std::string &customer_id, int32_t print_quantity, const std::string &attachments);
+                          int64_t customer_id, int32_t print_quantity, const std::string &attachments);
+        DB_RESULT update_order(const Order &order);  // 新增：传入Order结构体的更新接口
         DB_RESULT get_all_orders(std::vector<Order> &out_orders);
         DB_RESULT get_order_by_id(int64_t order_id, Order &out_order);
-        DB_RESULT get_orders_by_customer(const std::string &customer_id, std::vector<Order> &out_orders);
+        DB_RESULT get_orders_by_customer(int64_t customer_id, std::vector<Order> &out_orders);
 
 
         // EmbedDevice operations
@@ -276,6 +280,7 @@ namespace lmdb
                               int32_t port = 0, const std::string &mac_address = "", int status = 0,
                               const std::string &location = "", const std::string &description = "",
                               const std::string &capabilities = "", const std::string &metadata = "");
+        DB_RESULT add_embed_device(EmbedDevice &device);  // 新增：传入EmbedDevice结构体的接口
         DB_RESULT remove_embed_device(int64_t device_id);
         DB_RESULT remove_embed_device(const std::string &device_name);
         DB_RESULT update_embed_device(int64_t device_id, const std::string &device_name, int device_type = -1,
@@ -292,6 +297,7 @@ namespace lmdb
                                  int32_t port = -1, const std::string &mac_address = "", int status = -1,
                                  const std::string &location = "", const std::string &description = "",
                                  const std::string &capabilities = "", const std::string &metadata = "");
+        DB_RESULT update_embed_device(const EmbedDevice &device);  // 新增：传入EmbedDevice结构体的更新接口
         DB_RESULT get_all_embed_devices(std::vector<EmbedDevice> &out_devices);
         DB_RESULT get_embed_device_by_id(int64_t device_id, EmbedDevice &out_device);
         DB_RESULT get_embed_device_by_name(const std::string &device_name, EmbedDevice &out_device);
@@ -300,12 +306,14 @@ namespace lmdb
 
         // Print task operations
         DB_RESULT add_print_task(int order_id, const std::string &print_name, const std::string &gcode_filename, int total_quantity);
+        DB_RESULT add_print_task(PrintTask &task);  // 新增：传入PrintTask结构体的接口
         DB_RESULT remove_print_task(int print_task_id);
         DB_RESULT remove_print_task(const std::string &print_name);
         DB_RESULT update_print_task(int print_task_id, const std::string &print_name, const std::string &gcode_filename,
                                int total_quantity, int completed_quantity);
         DB_RESULT update_print_task(const std::string &print_name, const std::string &new_print_name, const std::string &gcode_filename,
                                int total_quantity, int completed_quantity);
+        DB_RESULT update_print_task(const PrintTask &task);  // 新增：传入PrintTask结构体的更新接口
         DB_RESULT get_all_print_tasks(std::vector<PrintTask> &out_tasks);
         DB_RESULT get_print_task_by_id(int print_task_id, PrintTask &out_task);
         DB_RESULT get_print_tasks_by_order(int order_id, std::vector<PrintTask> &out_tasks);
@@ -314,10 +322,12 @@ namespace lmdb
 
         // G-code file operations
         DB_RESULT add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
+        DB_RESULT add_gcode_file(Gcode_file &file);  // 新增：传入Gcode_file结构体的接口
         DB_RESULT remove_gcode_file(int gcode_file_id);
         DB_RESULT remove_gcode_file(const std::string& filename);
         DB_RESULT update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
         DB_RESULT update_gcode_file(const std::string& filename, const std::string& new_filename, const std::string& encrypted_path, const std::string& aeskey);
+        DB_RESULT update_gcode_file(const Gcode_file &file);  // 新增：传入Gcode_file结构体的更新接口
         DB_RESULT get_all_gcode_files(std::vector<Gcode_file> &out_files);
         DB_RESULT get_gcode_file_by_id(int gcode_file_id, Gcode_file &out_file);
         DB_RESULT get_gcode_file_by_filename(const std::string& filename, Gcode_file &out_file);
@@ -335,6 +345,12 @@ namespace lmdb
         void print(const std::string &query = "");
 
         const std::string& get_database_path() const;
+        
+        // Database backup and restore
+        DB_RESULT backup_database(const std::string& backup_path);
+        DB_RESULT restore_database(const std::string& backup_path);
+        DB_RESULT export_to_sql(const std::string& sql_file_path);
+        DB_RESULT import_from_sql(const std::string& sql_file_path);
 
         
         // Test functions
@@ -345,6 +361,10 @@ namespace lmdb
         
         // Generate comprehensive test cases for all database functions
         void generate_database_test_cases();
+
+        // Static utility functions
+        static std::vector<std::string> enumerate_database_files(const std::string& data_directory = "");
+        static std::string get_default_data_directory();
 
     protected:
         lmDBCoreImpl *impl;
