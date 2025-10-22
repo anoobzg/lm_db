@@ -99,6 +99,7 @@ struct Order
 {
     int64_t id;                    // Auto-increment primary key
     std::string name;              // Order name
+    std::string serial_number;     // Order serial number (unique identifier)
     std::string description;       // Order description
     std::string attachments;       // JSON string of attachments array
     int32_t print_quantity;        // Print quantity
@@ -156,16 +157,14 @@ struct EmbedDevice
     std::string metadata;          // Additional metadata (JSON string of key-value pairs)
 
     EmbedDevice() = default;
-    EmbedDevice(const std::string &device_name, int device_type = 0,
-                const std::string &model = "", const std::string &serial_number = "",
-                const std::string &firmware_version = "", const std::string &hardware_version = "",
+    EmbedDevice(const std::string &serial_number, const std::string &device_name = "", int device_type = 0,
+                const std::string &model = "", const std::string &firmware_version = "", const std::string &hardware_version = "",
                 const std::string &manufacturer = "", const std::string &ip_address = "",
                 int32_t port = 0, const std::string &mac_address = "", int status = 0,
                 const std::string &location = "", const std::string &description = "",
                 const std::string &capabilities = "", const std::string &metadata = "")
-        : device_name(device_name), device_type(device_type), model(model),
-          serial_number(serial_number), firmware_version(firmware_version),
-          hardware_version(hardware_version), manufacturer(manufacturer),
+        : serial_number(serial_number), device_name(device_name), device_type(device_type), model(model),
+          firmware_version(firmware_version), hardware_version(hardware_version), manufacturer(manufacturer),
           ip_address(ip_address), port(port), mac_address(mac_address),
           status(status), location(location), description(description),
           capabilities(capabilities), metadata(metadata) {
@@ -261,14 +260,15 @@ namespace lmdb
                        int32_t print_quantity = 1, const std::string &attachments = "");
         DB_RESULT add_order(Order &order);  // 新增：传入Order结构体的接口
         DB_RESULT remove_order(int64_t order_id);
-        DB_RESULT remove_order(const std::string &name);
+        DB_RESULT remove_order(const std::string &serial_number);
         DB_RESULT update_order(int64_t order_id, const std::string &name, const std::string &description,
-                          int64_t customer_id, int32_t print_quantity, const std::string &attachments);
-        DB_RESULT update_order(const std::string &name, const std::string &new_name, const std::string &description,
+        int64_t customer_id, int32_t print_quantity, const std::string &attachments);
+        DB_RESULT update_order(const std::string &serial_number, const std::string &name, const std::string &description,
                           int64_t customer_id, int32_t print_quantity, const std::string &attachments);
         DB_RESULT update_order(const Order &order);  // 新增：传入Order结构体的更新接口
         DB_RESULT get_all_orders(std::vector<Order> &out_orders);
-        DB_RESULT get_order_by_id(int64_t order_id, Order &out_order);
+		DB_RESULT get_order_by_id(int64_t order_id, Order &out_order);
+        DB_RESULT get_order_by_serial(const std::string &serial_number, Order &out_order);
         DB_RESULT get_orders_by_customer(int64_t customer_id, std::vector<Order> &out_orders);
 
 
@@ -283,6 +283,7 @@ namespace lmdb
         DB_RESULT add_embed_device(EmbedDevice &device);  // 新增：传入EmbedDevice结构体的接口
         DB_RESULT remove_embed_device(int64_t device_id);
         DB_RESULT remove_embed_device(const std::string &device_name);
+        DB_RESULT remove_embed_device_by_serial_number(const std::string &serial_number);
         DB_RESULT update_embed_device(int64_t device_id, const std::string &device_name, int device_type = -1,
                                  const std::string &model = "", const std::string &serial_number = "",
                                  const std::string &firmware_version = "", const std::string &hardware_version = "",
@@ -290,17 +291,19 @@ namespace lmdb
                                  int32_t port = -1, const std::string &mac_address = "", int status = -1,
                                  const std::string &location = "", const std::string &description = "",
                                  const std::string &capabilities = "", const std::string &metadata = "");
-        DB_RESULT update_embed_device(const std::string &device_name, const std::string &new_device_name, int device_type = -1,
-                                 const std::string &model = "", const std::string &serial_number = "",
+
+        DB_RESULT update_embed_device(const std::string &serial_number, const std::string &new_device_name, int device_type = -1,
+                                 const std::string &model = "", const std::string &new_serial_number = "",
                                  const std::string &firmware_version = "", const std::string &hardware_version = "",
                                  const std::string &manufacturer = "", const std::string &ip_address = "",
                                  int32_t port = -1, const std::string &mac_address = "", int status = -1,
                                  const std::string &location = "", const std::string &description = "",
                                  const std::string &capabilities = "", const std::string &metadata = "");
+
         DB_RESULT update_embed_device(const EmbedDevice &device);  // 新增：传入EmbedDevice结构体的更新接口
         DB_RESULT get_all_embed_devices(std::vector<EmbedDevice> &out_devices);
         DB_RESULT get_embed_device_by_id(int64_t device_id, EmbedDevice &out_device);
-        DB_RESULT get_embed_device_by_name(const std::string &device_name, EmbedDevice &out_device);
+        DB_RESULT get_embed_device_by_serial_number(const std::string &serial_number, EmbedDevice &out_device);
         DB_RESULT get_embed_devices_by_type(int device_type, std::vector<EmbedDevice> &out_devices);
 
 

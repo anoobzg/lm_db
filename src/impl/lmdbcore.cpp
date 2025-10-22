@@ -196,6 +196,24 @@ bool verifyPassword(const std::string& password, const std::string& hashed_passw
     }
 }
 
+// Helper function to generate order serial number
+std::string generateOrderSerialNumber() {
+    // Get current timestamp
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    
+    // Format: ORD + YYYYMMDDHHMMSS + random 4 digits
+    std::tm* tm_info = std::localtime(&time_t);
+    char buffer[20];
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", tm_info);
+    
+    // Generate random 4-digit number
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(1000, 9999);
+    
+    return "ORD" + std::string(buffer) + std::to_string(dis(gen));
+}
 // Register ORM mappings
 REGISTER_AUTO_KEY(User, id)
 YLT_REFL(User, id, name, email, phone, address, password, role, permissions, groups, created_at, updated_at)
@@ -204,7 +222,7 @@ REGISTER_AUTO_KEY(Customer, id)
 YLT_REFL(Customer, id, name, phone, email, avatar_image, address, company, position, notes, created_at, updated_at)
 
 REGISTER_AUTO_KEY(Order, id)
-YLT_REFL(Order, id, name, description, attachments, print_quantity, customer_id, created_at, updated_at)
+YLT_REFL(Order, id, name, serial_number, description, attachments, print_quantity, customer_id, created_at, updated_at)
 
 REGISTER_AUTO_KEY(EmbedDevice, device_id)
 YLT_REFL(EmbedDevice, device_id, device_name, device_type, model, serial_number, firmware_version, hardware_version, manufacturer, ip_address, port, mac_address, status, location, description, last_seen, created_at, updated_at, session_id, capabilities, metadata)
@@ -225,13 +243,19 @@ namespace lmdb {
         : impl(new lmDBCoreImpl()) 
     {
         // Get user data directory
-        std::string userDataDir = getUserDataDirectory() + "/data/" +  db_name;
+        std::string userDataDir = getUserDataDirectory() + "/data/" ;
         
         // Create directory if it doesn't exist
         createDirectoryIfNotExists(userDataDir);
         
+        std::string dbDir = userDataDir +  db_name;
+
+
+        // Create directory if it doesn't exist
+        createDirectoryIfNotExists(dbDir);
+
         // Build full database path: userDataDir/db_name.db
-        db_path_ = userDataDir + "/" + db_name + ".db";
+        db_path_ = dbDir + "/" + db_name + ".db";
         
         // Connect to database
         impl->sqlite.connect(db_path_);
@@ -262,19 +286,23 @@ namespace lmdb {
             // Create all data tables
             ormpp_auto_key user_key{"id"};
             ormpp_not_null user_not_null{{"name"}};
-            impl->sqlite.create_datatable<User>(user_key, user_not_null);
+            ormpp_unique user_unique{{"name"}};
+            impl->sqlite.create_datatable<User>(user_key, user_not_null,user_unique);
 
             ormpp_auto_key customer_key{"id"};
             ormpp_not_null customer_not_null{{"name"}};
-            impl->sqlite.create_datatable<Customer>(customer_key, customer_not_null);
+            ormpp_unique   customer_unique{{"name"}};
+            impl->sqlite.create_datatable<Customer>(customer_key, customer_not_null,customer_unique);
 
             ormpp_auto_key order_key{"id"};
-            ormpp_not_null order_not_null{{"name"}};
-            impl->sqlite.create_datatable<Order>(order_key, order_not_null);
+            ormpp_not_null order_not_null{{"serial_number"}};
+            ormpp_unique order_unique{{"serial_number"}};
+            impl->sqlite.create_datatable<Order>(order_key, order_not_null, order_unique);
 
             ormpp_auto_key embed_device_key{"device_id"};
-            ormpp_not_null embed_device_not_null{{"device_name"}};
-            impl->sqlite.create_datatable<EmbedDevice>(embed_device_key, embed_device_not_null);
+            ormpp_not_null embed_device_not_null{{"serial_number"}};
+            ormpp_unique embed_device_unique{{"serial_number"}};
+            impl->sqlite.create_datatable<EmbedDevice>(embed_device_key, embed_device_not_null, embed_device_unique);
 
             ormpp_auto_key print_task_key{"id"};
             impl->sqlite.create_datatable<PrintTask>(print_task_key);
@@ -999,6 +1027,15 @@ namespace lmdb {
             order.customer_id = customer_id;
             order.print_quantity = print_quantity;
             order.attachments = attachments;
+            order.serial_number = generateOrderSerialNumber();
+            
+            // Check if serial number already exists (very unlikely but possible)
+            auto existing_serial = impl->sqlite.query_s<Order>("serial_number = ?", order.serial_number);
+            if (!existing_serial.empty())
+            {
+                // Generate a new serial number if collision occurs
+                order.serial_number = generateOrderSerialNumber();
+            }
             
             // Set timestamps
             time_t now = time(0);
@@ -1033,12 +1070,13 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            // Check if order already exists
-            auto existing = impl->sqlite.query_s<Order>("name = ?", order.name);
-            if (!existing.empty())
+            auto existing_serial = impl->sqlite.query_s<Order>("serial_number = ?", order.serial_number);
+            if (!existing_serial.empty())
             {
+                // Generate a new serial number if collision occurs
                 return DB_ERROR_DUPLICATE_RECORD; // Order name already exists
             }
+
 
             // Set timestamps
             time_t now = time(0);
@@ -1069,16 +1107,24 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::remove_order(const std::string& name)
+    DB_RESULT lmDBCore::remove_order(const std::string& serial)
     {
         try
         {
-            impl->sqlite.delete_records_s<Order>("name = ?", name);
+            // First try to find by serial_number, then by name for backward compatibility
+            auto orders_by_serial = impl->sqlite.query_s<Order>("serial_number = ?", serial);
+            if (!orders_by_serial.empty()) {
+                impl->sqlite.delete_records_s<Order>("serial_number = ?", serial);
+                return DB_SUCCESS;
+            }
+            
+            // Fallback to name for backward compatibility
+            impl->sqlite.delete_records_s<Order>("name = ?", serial);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Remove order by name failed: " << e.what() << std::endl;
+            std::cerr << "Remove order by serial/name failed: " << e.what() << std::endl;
             return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
@@ -1112,12 +1158,15 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_order(const std::string& name, const std::string& new_name, const std::string& description,
-                                int64_t customer_id, int32_t print_quantity, const std::string& attachments)
+    DB_RESULT lmDBCore::update_order(const std::string& serial, const std::string& new_name, const std::string& description,
+                               int64_t customer_id, int32_t print_quantity, const std::string& attachments)
     {
         try
         {
-            auto orders = impl->sqlite.query_s<Order>("name = ?", name);
+            // First try to find by serial_number, then by name for backward compatibility
+            auto orders = impl->sqlite.query_s<Order>("serial_number = ?", serial);
+          
+            
             if (orders.empty())
             {
                 return DB_ERROR_RECORD_NOT_FOUND;
@@ -1146,41 +1195,16 @@ namespace lmdb {
     {
         try
         {
-            // Validate input parameters
-            if (order.id <= 0) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            if (order.name.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            if (order.description.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            if (order.customer_id <= 0) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            // Check if order exists
-            auto existing = impl->sqlite.query_s<Order>("id = ?", order.id);
-            if (existing.empty())
+
+            auto orders = impl->sqlite.query_s<Order>("serial_number = ?", order.serial_number);
+            if (orders.empty())
             {
                 return DB_ERROR_RECORD_NOT_FOUND;
-            }
-
-            // Check if new name conflicts with existing orders (excluding current order)
-            auto name_conflict = impl->sqlite.query_s<Order>("name = ? AND id != ?", order.name, order.id);
-            if (!name_conflict.empty())
-            {
-                return DB_ERROR_DUPLICATE_RECORD; // Order name already exists
             }
 
             // Create a copy of the order with updated timestamp
             Order updated_order = order;
             updated_order.updated_at = static_cast<int64_t>(time(0));
-            
             impl->sqlite.update(updated_order);
             return DB_SUCCESS;
         }
@@ -1223,6 +1247,28 @@ namespace lmdb {
         }
     }
 
+    DB_RESULT lmDBCore::get_order_by_serial(const std::string& serial_number, Order &out_order)
+    {
+        try
+        {
+            if (serial_number.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            auto orders = impl->sqlite.query_s<Order>("serial_number = ?", serial_number);
+            if (orders.empty()) {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            out_order = orders[0];
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get order by serial failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
     DB_RESULT lmDBCore::get_orders_by_customer(int64_t customer_id, std::vector<Order> &out_orders)
     {
         try
@@ -1248,13 +1294,16 @@ namespace lmdb {
     {
         try
         {
-            auto existing = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
-            if (!existing.empty())
-            {
-                return DB_ERROR_RECORD_NOT_FOUND; // Device name already exists
+            // Check if serial_number already exists (now the unique constraint)
+            if (!serial_number.empty()) {
+                auto existing = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", serial_number);
+                if (!existing.empty())
+                {
+                    return DB_ERROR_DUPLICATE_RECORD; // Serial number already exists
+                }
             }
 
-            EmbedDevice device(device_name, device_type, model, serial_number, firmware_version,
+            EmbedDevice device(serial_number, device_name, device_type, model, firmware_version,
                               hardware_version, manufacturer, ip_address, port, mac_address,
                               status, location, description, capabilities, metadata);
             
@@ -1264,7 +1313,7 @@ namespace lmdb {
         catch (const std::exception &e)
         {
             std::cerr << "Add embed device failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
@@ -1273,16 +1322,16 @@ namespace lmdb {
     {
         try
         {
-            // Validate input parameters
-            if (device.device_name.empty()) {
+            // Validate input parameters - serial_number is now required
+            if (device.serial_number.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            // Check if device already exists
-            auto existing = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device.device_name);
+            // Check if serial_number already exists (now the unique constraint)
+            auto existing = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", device.serial_number);
             if (!existing.empty())
             {
-                return DB_ERROR_DUPLICATE_RECORD; // Device name already exists
+                return DB_ERROR_DUPLICATE_RECORD; // Serial number already exists
             }
 
             // Set timestamps
@@ -1325,6 +1374,20 @@ namespace lmdb {
         catch (const std::exception &e)
         {
             std::cerr << "Remove embed device by name failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::remove_embed_device_by_serial_number(const std::string& serial_number)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<EmbedDevice>("serial_number = ?", serial_number);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove embed device by serial number failed: " << e.what() << std::endl;
             return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
@@ -1376,8 +1439,9 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_embed_device(const std::string& device_name, const std::string& new_device_name, int device_type,
-                                       const std::string& model, const std::string& serial_number,
+
+    DB_RESULT lmDBCore::update_embed_device(const std::string& serial_number, const std::string& new_device_name, int device_type,
+                                       const std::string& model, const std::string& new_serial_number,
                                        const std::string& firmware_version, const std::string& hardware_version,
                                        const std::string& manufacturer, const std::string& ip_address,
                                        int32_t port, const std::string& mac_address, int status,
@@ -1386,7 +1450,7 @@ namespace lmdb {
     {
         try
         {
-            auto devices = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
+            auto devices = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", serial_number);
             if (devices.empty())
             {
                 return DB_ERROR_RECORD_NOT_FOUND;
@@ -1398,7 +1462,16 @@ namespace lmdb {
             // Only update fields that are not default values
             if (device_type != -1) device.device_type = device_type;
             if (!model.empty()) device.model = model;
-            if (!serial_number.empty()) device.serial_number = serial_number;
+            if (!new_serial_number.empty()) {
+                // Check if new serial number conflicts with existing devices
+                if (new_serial_number != serial_number) {
+                    auto existing = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", new_serial_number);
+                    if (!existing.empty()) {
+                        return DB_ERROR_DUPLICATE_RECORD; // New serial number already exists
+                    }
+                }
+                device.serial_number = new_serial_number;
+            }
             if (!firmware_version.empty()) device.firmware_version = firmware_version;
             if (!hardware_version.empty()) device.hardware_version = hardware_version;
             if (!manufacturer.empty()) device.manufacturer = manufacturer;
@@ -1418,7 +1491,7 @@ namespace lmdb {
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Update embed device by name failed: " << e.what() << std::endl;
+            std::cerr << "Update embed device by serial number failed: " << e.what() << std::endl;
             return DB_ERROR_RECORD_NOT_FOUND;
         }
     }
@@ -1433,7 +1506,7 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (device.device_name.empty()) {
+            if (device.serial_number.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
@@ -1441,15 +1514,19 @@ namespace lmdb {
             auto existing = impl->sqlite.query_s<EmbedDevice>("device_id = ?", device.device_id);
             if (existing.empty())
             {
-                return DB_ERROR_RECORD_NOT_FOUND;
+                 existing = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", device.serial_number);
+                 if(existing .empty())
+                 {
+                     return DB_ERROR_RECORD_NOT_FOUND;
+                 }
             }
 
-            // Check if new name conflicts with existing devices (excluding current device)
-            auto name_conflict = impl->sqlite.query_s<EmbedDevice>("device_name = ? AND device_id != ?", device.device_name, device.device_id);
-            if (!name_conflict.empty())
-            {
-                return DB_ERROR_DUPLICATE_RECORD; // Device name already exists
-            }
+            // Check if new serial_number conflicts with existing devices (excluding current device)
+            // auto serial_conflict = impl->sqlite.query_s<EmbedDevice>("serial_number = ? AND device_id != ?", device.serial_number, device.device_id);
+            // if (!serial_conflict.empty())
+            // {
+            //     return DB_ERROR_DUPLICATE_RECORD; // Serial number already exists
+            // }
 
             // Create a copy of the device with updated timestamp
             EmbedDevice updated_device = device;
@@ -1497,11 +1574,12 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_embed_device_by_name(const std::string& device_name, EmbedDevice &out_device)
+
+    DB_RESULT lmDBCore::get_embed_device_by_serial_number(const std::string& serial_number, EmbedDevice &out_device)
     {
         try
         {
-            auto devices = impl->sqlite.query_s<EmbedDevice>("device_name = ?", device_name);
+            auto devices = impl->sqlite.query_s<EmbedDevice>("serial_number = ?", serial_number);
             if (devices.empty()) {
                 return DB_ERROR_RECORD_NOT_FOUND;
             }
@@ -1510,7 +1588,7 @@ namespace lmdb {
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Get embed device by name failed: " << e.what() << std::endl;
+            std::cerr << "Get embed device by serial number failed: " << e.what() << std::endl;
             return DB_ERROR_SQL_EXECUTION;
         }
     }
@@ -2706,11 +2784,13 @@ namespace lmdb {
             DB_RESULT add_device_result2 = add_embed_device("Test Device 2", 2, "Model 2", "Serial 2", "Firmware 2.0", "Hardware 2.0", "Manufacturer 2", "192.168.1.101", 8081, "00:11:22:33:44:56", 2, "Location 2", "Description 2", "Capabilities 2", "Metadata 2");
             std::cout << "      - Add device 2: " << (add_device_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            // Test get device
-            std::cout << "   5.2 Test get_embed_device_by_name():\n";
-            EmbedDevice device1;
-            DB_RESULT get_device_result = get_embed_device_by_name("Test Device 1", device1);
-            std::cout << "      - Get device 1: " << (get_device_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+  
+            
+            // Test get device by serial number (new primary method)
+            std::cout << "   5.3 Test get_embed_device_by_serial_number():\n";
+            EmbedDevice device1_by_serial;
+            DB_RESULT get_device_by_serial_result = get_embed_device_by_serial_number("Serial 1", device1_by_serial);
+            std::cout << "      - Get device 1 by serial: " << (get_device_by_serial_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // Test get devices by type
             std::cout << "   5.3 Test get_embed_devices_by_type():\n";
@@ -2728,6 +2808,14 @@ namespace lmdb {
             std::vector<EmbedDevice> all_devices;
             DB_RESULT get_all_devices_result = get_all_embed_devices(all_devices);
             std::cout << "      - Get all devices count: " << (get_all_devices_result == DB_SUCCESS ? std::to_string(all_devices.size()) : "FAILED") << " devices" << std::endl;
+            
+            // Test new serial_number-based methods
+            std::cout << "   5.6 Test new serial_number-based methods:\n";
+            DB_RESULT update_by_serial_result = update_embed_device("Serial 1", "Updated Device 1 by Serial", 1, "Updated Model 1", "Updated Serial 1", "Updated Firmware 1.2", "Updated Hardware 1.2", "Updated Manufacturer 1", "192.168.1.201", 8083, "00:11:22:33:44:77", 3, "Updated Location 1", "Updated Description 1", "Updated Capabilities 1", "Updated Metadata 1");
+            std::cout << "      - Update device by serial: " << (update_by_serial_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            DB_RESULT remove_by_serial_result = remove_embed_device_by_serial_number("Serial 2");
+            std::cout << "      - Remove device by serial: " << (remove_by_serial_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // ========== Print Task Management Test Cases ==========
             std::cout << "\n6. Print Task Management Function Test Cases:\n";
