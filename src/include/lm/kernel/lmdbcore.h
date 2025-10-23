@@ -4,6 +4,7 @@
 #include <vector>
 #include <ctime>
 #include <chrono>
+#include <memory>
 
 
 enum  USER_ROLE
@@ -37,7 +38,7 @@ enum DB_RESULT
 
 // Helper function to get error message from error code
 const char* get_db_error_message(DB_RESULT error_code);
-
+ 
 // User data structure (matches user_service.proto)
 struct User
 {
@@ -180,27 +181,40 @@ struct EmbedDevice
 // Print task data structure
 struct PrintTask
 {
-    int id;
-    int order_id;
-    std::string print_name;
-    std::string gcode_filename;
-    int total_quantity;
-    int completed_quantity;
+  int64_t id;
+  std::string order_serial_number;  // Corresponds to Order's serial_number
+  std::string print_name;
+  std::string file_uuid;
+  int total_quantity;
+  int completed_quantity;
 
     PrintTask() = default;
-    PrintTask(int oid, const std::string &name, const std::string &gcode, int total)
-        : order_id(oid), print_name(name), gcode_filename(gcode),
+    PrintTask(const std::string &order_serial, const std::string &name, const std::string &file_uuid, int total)
+        : order_serial_number(order_serial), print_name(name), file_uuid(file_uuid),
           total_quantity(total), completed_quantity(0) {}
 };
 
 // gcode 文件 
-struct Gcode_file
+struct File_record
 {
   int id;
-  std::string filename;
-  std::string encrypted_path;
-  std::string aeskey; // 存储32字节的AES密钥
-  std::string upload_time;
+  std::string uuid;              // 
+  std::string filename;          // 
+  std::string encrypted_path;    //  
+  std::string aeskey;            //  
+  std::string upload_time;       //  
+  std::string file_type;         // (gcode, stl, etc.)
+  int customer_id;               // 
+};
+
+// Order File_record mapping
+struct OrderFile
+{
+  int id;                        //  main key
+  int order_id;                  //  order id 
+  std::string file_uuid;         //  file uuid 
+  std::string created_at;        //  create time
+  std::string description;       //  
 };
 
 
@@ -226,7 +240,8 @@ namespace lmdb
                          const std::string &phone = "", const std::string &address = "", int role = -1);
         DB_RESULT update_user(const std::string &name, const std::string &new_name, const std::string &email,
                          const std::string &phone = "", const std::string &address = "", int role = -1);
-        DB_RESULT update_user(const User &user);  // 新增：传入User结构体的更新接口
+        DB_RESULT update_user(const User &user);  //  
+        DB_RESULT update_user_role_by_name(const std::string &name, int role);  //  
         DB_RESULT set_password(int64_t id, const std::string &new_password);
         DB_RESULT set_password(const std::string &name, const std::string &new_password);
         DB_RESULT get_password(int64_t id, std::string &out_password);
@@ -234,8 +249,10 @@ namespace lmdb
         DB_RESULT get_user_by_name(const std::string &name, User &out_user);
         DB_RESULT get_all_users(std::vector<User> &out_users);
         DB_RESULT verify_user(const std::string &name, const std::string &password);
-
-
+        
+        // User role validation helper functions
+        bool is_valid_user_role(int role);  //  
+ 
         // Customer operations
         DB_RESULT add_customer(const std::string &name, const std::string &phone, const std::string &email = "",
                           const std::string &avatar_image = "", const std::string &address = "", const std::string &company = "",
@@ -308,34 +325,53 @@ namespace lmdb
 
 
         // Print task operations
-        DB_RESULT add_print_task(int order_id, const std::string &print_name, const std::string &gcode_filename, int total_quantity);
+        DB_RESULT add_print_task(const std::string &order_serial_number, const std::string &print_name, const std::string &file_uuid, int total_quantity);
         DB_RESULT add_print_task(PrintTask &task);  // 新增：传入PrintTask结构体的接口
-        DB_RESULT remove_print_task(int print_task_id);
+        DB_RESULT remove_print_task(int64_t print_task_id);
         DB_RESULT remove_print_task(const std::string &print_name);
-        DB_RESULT update_print_task(int print_task_id, const std::string &print_name, const std::string &gcode_filename,
+        DB_RESULT update_print_task(int64_t print_task_id, const std::string &print_name, const std::string &file_uuid,
                                int total_quantity, int completed_quantity);
-        DB_RESULT update_print_task(const std::string &print_name, const std::string &new_print_name, const std::string &gcode_filename,
+        DB_RESULT update_print_task(const std::string &print_name, const std::string &new_print_name, const std::string &file_uuid,
                                int total_quantity, int completed_quantity);
         DB_RESULT update_print_task(const PrintTask &task);  // 新增：传入PrintTask结构体的更新接口
         DB_RESULT get_all_print_tasks(std::vector<PrintTask> &out_tasks);
-        DB_RESULT get_print_task_by_id(int print_task_id, PrintTask &out_task);
-        DB_RESULT get_print_tasks_by_order(int order_id, std::vector<PrintTask> &out_tasks);
-        DB_RESULT update_print_progress(int print_task_id, int completed_quantity);
+        DB_RESULT get_print_task_by_id(int64_t print_task_id, PrintTask &out_task);
+        DB_RESULT get_print_tasks_by_order(const std::string &order_serial_number, std::vector<PrintTask> &out_tasks);
+        DB_RESULT update_print_progress(int64_t print_task_id, int completed_quantity);
 
 
-        // G-code file operations
-        DB_RESULT add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
-        DB_RESULT add_gcode_file(Gcode_file &file);  // 新增：传入Gcode_file结构体的接口
-        DB_RESULT remove_gcode_file(int gcode_file_id);
-        DB_RESULT remove_gcode_file(const std::string& filename);
-        DB_RESULT update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey);
-        DB_RESULT update_gcode_file(const std::string& filename, const std::string& new_filename, const std::string& encrypted_path, const std::string& aeskey);
-        DB_RESULT update_gcode_file(const Gcode_file &file);  // 新增：传入Gcode_file结构体的更新接口
-        DB_RESULT get_all_gcode_files(std::vector<Gcode_file> &out_files);
-        DB_RESULT get_gcode_file_by_id(int gcode_file_id, Gcode_file &out_file);
-        DB_RESULT get_gcode_file_by_filename(const std::string& filename, Gcode_file &out_file);
-        DB_RESULT get_total_gcode_files_count(int &out_count);
+        // File record operations
+        DB_RESULT add_file_record(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type = "gcode");
+        DB_RESULT add_file_record(File_record &file);  // 新增：传入File_record结构体的接口
+        DB_RESULT remove_file_record(const std::string& uuid);
+        DB_RESULT update_file_record(const std::string& uuid, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type = "gcode");
+        DB_RESULT update_file_record(const File_record &file);  // 新增：传入File_record结构体的更新接口
+        DB_RESULT get_all_file_records(std::vector<File_record> &out_files);
+        DB_RESULT get_file_records_by_customer(int customer_id, std::vector<File_record> &out_files);  // 新增：按客户ID获取文件
+        DB_RESULT get_file_record(const std::string& uuid, File_record &out_file);
+        DB_RESULT get_total_file_records_count(int &out_count);
+        DB_RESULT get_file_records_count_by_customer(int customer_id, int &out_count);  // 新增：获取指定客户的文件数量
 
+        // Order-File relationship operations 
+        DB_RESULT add_order_file_relation(int order_id, const std::string& file_uuid, const std::string& description = "");
+        DB_RESULT remove_order_file_relation(int order_id, const std::string& file_uuid);
+        DB_RESULT remove_all_order_file_relations(int order_id);  //  
+        DB_RESULT remove_all_file_order_relations(const std::string& file_uuid);  //  
+        DB_RESULT get_files_by_order(int order_id, std::vector<File_record> &out_files);  // 
+        DB_RESULT get_orders_by_file(const std::string& file_uuid, std::vector<Order> &out_orders);  // 
+        DB_RESULT get_order_file_relations(int order_id, std::vector<OrderFile> &out_relations);  //  
+        DB_RESULT get_file_order_relations(const std::string& file_uuid, std::vector<OrderFile> &out_relations);  // 
+        DB_RESULT update_order_file_relation(int order_id, const std::string& file_uuid, const std::string& description);  //  
+        DB_RESULT get_order_file_relation_count(int order_id, int &out_count);  //  
+        DB_RESULT get_file_order_relation_count(const std::string& file_uuid, int &out_count);  //  
+
+        // File encryption and decryption operations (static functions)
+  
+        static DB_RESULT encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& output_path, int chunk_index = 0, bool append_mode = false);
+        static DB_RESULT decrypt_file_with_key(const std::string& input_path, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data);
+        static DB_RESULT decrypt_file_chunk(const std::string& input_path, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data);  // 新增：解密指定块
+        static DB_RESULT generate_random_aes_key(std::vector<uint8_t>& out_key);
+        static DB_RESULT generate_uuid(std::string& out_uuid);
 
         // Statistics
         DB_RESULT get_total_orders_count(int &out_count);

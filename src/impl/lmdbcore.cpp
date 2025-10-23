@@ -8,8 +8,8 @@
 #include <sstream>
 #include <algorithm>
 #include <fstream>
-#include <random>
 #include <iomanip>
+#include <random>
 #include <filesystem>
 #include <vector>
 #include <openssl/aes.h>
@@ -17,6 +17,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
+#include <sstream>
 
 // Platform-specific headers for user data directory
 #ifdef _WIN32
@@ -30,6 +31,27 @@
 #include <pwd.h>
 #include <climits>
 #endif
+
+// Helper functions for hex conversion
+std::string bytesToHex(const std::vector<uint8_t>& bytes) {
+    std::stringstream ss;
+    for (uint8_t byte : bytes) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+    return ss.str();
+}
+
+ 
+
+std::vector<uint8_t> hexToBytes(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        std::string byteString = hex.substr(i, 2);
+        uint8_t byte = static_cast<uint8_t>(std::strtol(byteString.c_str(), nullptr, 16));
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
 
 // Helper function to get error message from error code
 const char* get_db_error_message(DB_RESULT error_code) {
@@ -124,14 +146,7 @@ bool createDirectoryIfNotExists(const std::string& path) {
 #endif
 }
 
-// Helper function to convert bytes to hex string
-std::string bytesToHex(const std::vector<uint8_t>& bytes) {
-    std::ostringstream oss;
-    for (uint8_t byte : bytes) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-    }
-    return oss.str();
-}
+
 
 // Helper function to generate random salt
 std::string generateSalt() {
@@ -179,7 +194,7 @@ bool verifyPassword(const std::string& password, const std::string& hashed_passw
     try {
         // Extract salt from stored hash (first 32 characters = 16 bytes in hex)
         if (hashed_password_with_salt.length() < 32) {
-            return DB_ERROR_RECORD_NOT_FOUND;
+            return false;
         }
         
         std::string salt = hashed_password_with_salt.substr(0, 32);
@@ -228,11 +243,16 @@ REGISTER_AUTO_KEY(EmbedDevice, device_id)
 YLT_REFL(EmbedDevice, device_id, device_name, device_type, model, serial_number, firmware_version, hardware_version, manufacturer, ip_address, port, mac_address, status, location, description, last_seen, created_at, updated_at, session_id, capabilities, metadata)
 
 REGISTER_AUTO_KEY(PrintTask, id)
-YLT_REFL(PrintTask, id, order_id, print_name, gcode_filename, total_quantity, completed_quantity)
+YLT_REFL(PrintTask, id, order_serial_number, print_name, file_uuid, total_quantity, completed_quantity)
 
-REGISTER_AUTO_KEY(Gcode_file, id)
-YLT_REFL(Gcode_file, id, filename, encrypted_path, aeskey, upload_time)
+REGISTER_AUTO_KEY(File_record, id)
+YLT_REFL(File_record, id, uuid, filename, encrypted_path, aeskey, upload_time, file_type, customer_id)
 
+REGISTER_AUTO_KEY(OrderFile, id)
+YLT_REFL(OrderFile, id, order_id, file_uuid, created_at, description)
+
+ 
+ 
 namespace lmdb {
     struct lmDBCoreImpl
     {
@@ -307,9 +327,16 @@ namespace lmdb {
             ormpp_auto_key print_task_key{"id"};
             impl->sqlite.create_datatable<PrintTask>(print_task_key);
 
-            ormpp_auto_key gcode_file_key{"id"};
-            ormpp_unique gcode_file_unique{{"filename"}};
-            impl->sqlite.create_datatable<Gcode_file>(gcode_file_key, gcode_file_unique);
+            ormpp_auto_key file_key{"id"};
+            ormpp_not_null file_not_null{{"uuid"}};
+            ormpp_unique file_unique{{"uuid"}};
+            impl->sqlite.create_datatable<File_record>(file_key, file_not_null, file_unique);
+
+            // Create OrderFile relationship table
+            ormpp_auto_key order_file_key{"id"};
+            ormpp_not_null order_file_not_null{{"order_id", "file_uuid"}};
+            ormpp_unique order_file_unique{{"order_id", "file_uuid"}};  // 防止重复关联
+            impl->sqlite.create_datatable<OrderFile>(order_file_key, order_file_not_null, order_file_unique);
 
             return DB_SUCCESS;
         }
@@ -490,6 +517,7 @@ namespace lmdb {
             user.email = email;
             user.phone = phone;
             user.address = address;
+            user.password = users[0].password;  // 使用数据库中的原密码
             if (role >= 0) {
                 user.role = role;
             }
@@ -521,6 +549,7 @@ namespace lmdb {
             user.email = email;
             user.phone = phone;
             user.address = address;
+            user.password = users[0].password;  // 使用数据库中的原密码
             if (role >= 0) {
                 user.role = role;
             }
@@ -556,7 +585,7 @@ namespace lmdb {
             auto existing = impl->sqlite.query_s<User>("id = ?", user.id);
             if (existing.empty())
             {
-            return DB_ERROR_RECORD_NOT_FOUND;
+                return DB_ERROR_RECORD_NOT_FOUND;
             }
 
             // Check if new name conflicts with existing users (excluding current user)
@@ -568,7 +597,10 @@ namespace lmdb {
 
             // Create a copy of the user with updated timestamp
             User updated_user = user;
+            updated_user.password = existing[0].password;  // 使用数据库中的原密码
             updated_user.updated_at = static_cast<int64_t>(time(0));
+               
+   
             
             impl->sqlite.update(updated_user);
                 return DB_SUCCESS;
@@ -580,6 +612,48 @@ namespace lmdb {
         }
     }
 
+    DB_RESULT lmDBCore::update_user_role_by_name(const std::string& name, int role)
+    {
+        try
+        {
+            // Validate input parameters
+            if (name.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            // Validate role value
+            if (!is_valid_user_role(role)) {
+                std::cerr << "Invalid user role: " << role << std::endl;
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            // Check if user exists
+            auto users = impl->sqlite.query_s<User>("name = ?", name);
+            if (users.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND; // User not found
+            }
+
+            User user = users[0];
+            user.role = role;
+            
+            impl->sqlite.update(user);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update user role by name failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    bool lmDBCore::is_valid_user_role(int role)
+    {
+        return (role >= static_cast<int>(USER_ROLE::GUEST) && 
+                role <= static_cast<int>(USER_ROLE::ADMIN));
+    }
+
+ 
 
     DB_RESULT lmDBCore::set_password(int64_t id, const std::string& new_password)
     {
@@ -1608,14 +1682,14 @@ namespace lmdb {
     }
 
     // Print task operations
-    DB_RESULT lmDBCore::add_print_task(int order_id, const std::string& print_name, const std::string& gcode_filename, int total_quantity)
+    DB_RESULT lmDBCore::add_print_task(const std::string& order_serial_number, const std::string& print_name, const std::string& file_uuid, int total_quantity)
     {
         try
         {
             PrintTask print_task;
-            print_task.order_id = order_id;
+            print_task.order_serial_number = order_serial_number;
             print_task.print_name = print_name;
-            print_task.gcode_filename = gcode_filename;
+            print_task.file_uuid = file_uuid;
             print_task.total_quantity = total_quantity;
             print_task.completed_quantity = 0;
             impl->sqlite.insert(print_task);
@@ -1628,7 +1702,7 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::remove_print_task(int print_task_id)
+    DB_RESULT lmDBCore::remove_print_task(int64_t print_task_id)
     {
         try
         {
@@ -1656,8 +1730,8 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_print_task(int print_task_id, const std::string& print_name, const std::string& gcode_filename,
-                                     int total_quantity, int completed_quantity)
+    DB_RESULT lmDBCore::update_print_task(int64_t print_task_id, const std::string& print_name, const std::string& file_uuid,
+                               int total_quantity, int completed_quantity)
     {
         try
         {
@@ -1669,7 +1743,7 @@ namespace lmdb {
 
             PrintTask print_task = print_tasks[0];
             print_task.print_name = print_name;
-            print_task.gcode_filename = gcode_filename;
+            print_task.file_uuid = file_uuid;
             print_task.total_quantity = total_quantity;
             print_task.completed_quantity = completed_quantity;
 
@@ -1683,8 +1757,8 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_print_task(const std::string& print_name, const std::string& new_print_name, const std::string& gcode_filename,
-                                     int total_quantity, int completed_quantity)
+    DB_RESULT lmDBCore::update_print_task(const std::string& print_name, const std::string& new_print_name, const std::string& file_uuid,
+                               int total_quantity, int completed_quantity)
     {
         try
         {
@@ -1696,7 +1770,7 @@ namespace lmdb {
 
             PrintTask print_task = print_tasks[0];
             print_task.print_name = new_print_name;
-            print_task.gcode_filename = gcode_filename;
+            print_task.file_uuid = file_uuid;
             print_task.total_quantity = total_quantity;
             print_task.completed_quantity = completed_quantity;
 
@@ -1724,7 +1798,7 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_print_task_by_id(int print_task_id, PrintTask &out_task)
+    DB_RESULT lmDBCore::get_print_task_by_id(int64_t print_task_id, PrintTask &out_task)
     {
         try
         {
@@ -1742,11 +1816,11 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_print_tasks_by_order(int order_id, std::vector<PrintTask> &out_tasks)
+    DB_RESULT lmDBCore::get_print_tasks_by_order(const std::string& order_serial_number, std::vector<PrintTask> &out_tasks)
     {
         try
         {
-            out_tasks = impl->sqlite.query_s<PrintTask>("order_id = ?", order_id);
+            out_tasks = impl->sqlite.query_s<PrintTask>("order_serial_number = ?", order_serial_number);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -1756,7 +1830,7 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_print_progress(int print_task_id, int completed_quantity)
+    DB_RESULT lmDBCore::update_print_progress(int64_t print_task_id, int completed_quantity)
     {
         try
         {
@@ -1780,126 +1854,57 @@ namespace lmdb {
     }
 
     // G-code file operations
-    DB_RESULT lmDBCore::add_gcode_file(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
+    DB_RESULT lmDBCore::add_file_record(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type)
     {
         try
         {
-            auto existing = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
+            // Generate UUID for the new file
+            std::string uuid;
+            DB_RESULT uuid_result = lmDBCore::generate_uuid(uuid);
+            if (uuid_result != DB_SUCCESS) {
+                return uuid_result;
+            }
+            
+            // Check if UUID already exists (very unlikely but safe)
+            auto existing = impl->sqlite.query_s<File_record>("uuid = ?", uuid);
             if (!existing.empty())
             {
-                return DB_ERROR_RECORD_NOT_FOUND; // Filename already exists
+                return DB_ERROR_DUPLICATE_RECORD; // UUID already exists
             }
 
-            Gcode_file gcode_file;
-            gcode_file.filename = filename;
-            gcode_file.encrypted_path = encrypted_path;
+            File_record file_record;
+            file_record.uuid = uuid;
+            file_record.filename = filename;
+            file_record.encrypted_path = encrypted_path;
+            file_record.file_type = file_type;
+            file_record.customer_id = customer_id;
             
             // Copy AES key
-            gcode_file.aeskey = aeskey;
+            file_record.aeskey = aeskey;
             
             // Set upload time to current date
             time_t now = time(0);
             char buffer[100];
             strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", localtime(&now));
-            gcode_file.upload_time = buffer;
+            file_record.upload_time = buffer;
 
-            impl->sqlite.insert(gcode_file);
+            impl->sqlite.insert(file_record);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
             std::cerr << "Add gcode file failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
+            return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    DB_RESULT lmDBCore::remove_gcode_file(int gcode_file_id)
+
+
+    DB_RESULT lmDBCore::get_all_file_records(std::vector<File_record> &out_files)
     {
         try
         {
-            impl->sqlite.delete_records_s<Gcode_file>("id = ?", gcode_file_id);
-            return DB_SUCCESS;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Remove gcode file failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
-        }
-    }
-
-    DB_RESULT lmDBCore::remove_gcode_file(const std::string& filename)
-    {
-        try
-        {
-            impl->sqlite.delete_records_s<Gcode_file>("filename = ?", filename);
-            return DB_SUCCESS;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Remove gcode file by filename failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
-        }
-    }
-
-    DB_RESULT lmDBCore::update_gcode_file(int gcode_file_id, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey)
-    {
-        try
-        {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("id = ?", gcode_file_id);
-            if (gcode_files.empty())
-            {
-                return DB_ERROR_RECORD_NOT_FOUND;
-            }
-
-            Gcode_file gcode_file = gcode_files[0];
-            gcode_file.filename = filename;
-            gcode_file.encrypted_path = encrypted_path;
-            
-            // Copy AES key
-            gcode_file.aeskey = std::string(aeskey, 32);
-
-            impl->sqlite.update(gcode_file);
-            return DB_SUCCESS;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Update gcode file failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
-        }
-    }
-
-    DB_RESULT lmDBCore::update_gcode_file(const std::string& filename, const std::string& new_filename, const std::string& encrypted_path, const std::string& aeskey)
-    {
-        try
-        {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
-            if (gcode_files.empty())
-            {
-                return DB_ERROR_RECORD_NOT_FOUND;
-            }
-
-            Gcode_file gcode_file = gcode_files[0];
-            gcode_file.filename = new_filename;
-            gcode_file.encrypted_path = encrypted_path;
-            
-            // Copy AES key
-            gcode_file.aeskey = std::string(aeskey, 32);
-
-            impl->sqlite.update(gcode_file);
-            return DB_SUCCESS;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Update gcode file by filename failed: " << e.what() << std::endl;
-            return DB_ERROR_RECORD_NOT_FOUND;
-        }
-    }
-
-    DB_RESULT lmDBCore::get_all_gcode_files(std::vector<Gcode_file> &out_files)
-    {
-        try
-        {
-            out_files = impl->sqlite.query_s<Gcode_file>("");
+            out_files = impl->sqlite.query_s<File_record>("");
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -1909,53 +1914,329 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_gcode_file_by_id(int gcode_file_id, Gcode_file &out_file)
+
+    DB_RESULT lmDBCore::get_file_record(const std::string& uuid, File_record &out_file)
     {
         try
         {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("id = ?", gcode_file_id);
-            if (gcode_files.empty()) {
+            auto file_records = impl->sqlite.query_s<File_record>("uuid = ?", uuid);
+            if (file_records.empty()) {
                 return DB_ERROR_RECORD_NOT_FOUND;
             }
-            out_file = gcode_files[0];
+            out_file = file_records[0];
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Get gcode file by id failed: " << e.what() << std::endl;
+            std::cerr << "Get gcode file by UUID failed: " << e.what() << std::endl;
             return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    DB_RESULT lmDBCore::get_gcode_file_by_filename(const std::string& filename, Gcode_file &out_file)
+    DB_RESULT lmDBCore::remove_file_record(const std::string& uuid)
     {
         try
         {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("filename = ?", filename);
-            if (gcode_files.empty()) {
-                return DB_ERROR_RECORD_NOT_FOUND;
-            }
-            out_file = gcode_files[0];
+            impl->sqlite.delete_records_s<File_record>("uuid = ?", uuid);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Get gcode file by filename failed: " << e.what() << std::endl;
+            std::cerr << "Remove gcode file by UUID failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_file_record(const std::string& uuid, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type)
+    {
+        try
+        {
+            auto file_records = impl->sqlite.query_s<File_record>("uuid = ?", uuid);
+            if (file_records.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            File_record file = file_records[0];
+            file.filename = filename;
+            file.encrypted_path = encrypted_path;
+            file.aeskey = aeskey;
+            file.file_type = file_type;
+            file.customer_id = customer_id;
+            
+            impl->sqlite.update(file);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update gcode file by UUID failed: " << e.what() << std::endl;
+            return DB_ERROR_RECORD_NOT_FOUND;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_total_file_records_count(int &out_count)
+    {
+        try
+        {
+            auto file_records = impl->sqlite.query_s<File_record>("");
+            out_count = static_cast<int>(file_records.size());
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get total file records count failed: " << e.what() << std::endl;
             return DB_ERROR_SQL_EXECUTION;
         }
     }
 
-    DB_RESULT lmDBCore::get_total_gcode_files_count(int &out_count)
+    DB_RESULT lmDBCore::get_file_records_by_customer(int customer_id, std::vector<File_record> &out_files)
     {
         try
         {
-            auto gcode_files = impl->sqlite.query_s<Gcode_file>("");
-            out_count = static_cast<int>(gcode_files.size());
+            out_files = impl->sqlite.query_s<File_record>("customer_id = ?", customer_id);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Get total gcode files count failed: " << e.what() << std::endl;
+            std::cerr << "Get file records by customer failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_file_records_count_by_customer(int customer_id, int &out_count)
+    {
+        try
+        {
+            auto file_records = impl->sqlite.query_s<File_record>("customer_id = ?", customer_id);
+            out_count = static_cast<int>(file_records.size());
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get file records count by customer failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    // ==================== Order-File Relationship Operations ====================
+
+    DB_RESULT lmDBCore::add_order_file_relation(int order_id, const std::string& file_uuid, const std::string& description)
+    {
+        try
+        {
+            // Check if order exists
+            auto orders = impl->sqlite.query_s<Order>("id = ?", order_id);
+            if (orders.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND; // Order not found
+            }
+
+            // Check if file exists
+            auto files = impl->sqlite.query_s<File_record>("uuid = ?", file_uuid);
+            if (files.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND; // File not found
+            }
+
+            // Check if relation already exists
+            auto existing = impl->sqlite.query_s<OrderFile>("order_id = ? AND file_uuid = ?", order_id, file_uuid);
+            if (!existing.empty())
+            {
+                return DB_ERROR_DUPLICATE_RECORD; // Relation already exists
+            }
+
+            OrderFile relation;
+            relation.order_id = order_id;
+            relation.file_uuid = file_uuid;
+            relation.description = description;
+            
+            // Set creation time
+            time_t now = time(0);
+            char buffer[100];
+            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", localtime(&now));
+            relation.created_at = buffer;
+
+            impl->sqlite.insert(relation);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Add order-file relation failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::remove_order_file_relation(int order_id, const std::string& file_uuid)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<OrderFile>("order_id = ? AND file_uuid = ?", order_id, file_uuid);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove order-file relation failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::remove_all_order_file_relations(int order_id)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<OrderFile>("order_id = ?", order_id);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove all order-file relations failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::remove_all_file_order_relations(const std::string& file_uuid)
+    {
+        try
+        {
+            impl->sqlite.delete_records_s<OrderFile>("file_uuid = ?", file_uuid);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Remove all file-order relations failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_files_by_order(int order_id, std::vector<File_record> &out_files)
+    {
+        try
+        {
+            // Get all file UUIDs associated with the order
+            auto relations = impl->sqlite.query_s<OrderFile>("order_id = ?", order_id);
+            out_files.clear();
+            
+            for (const auto& relation : relations)
+            {
+                auto files = impl->sqlite.query_s<File_record>("uuid = ?", relation.file_uuid);
+                if (!files.empty())
+                {
+                    out_files.push_back(files[0]);
+                }
+            }
+            
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get files by order failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_orders_by_file(const std::string& file_uuid, std::vector<Order> &out_orders)
+    {
+        try
+        {
+            // Get all order IDs associated with the file
+            auto relations = impl->sqlite.query_s<OrderFile>("file_uuid = ?", file_uuid);
+            out_orders.clear();
+            
+            for (const auto& relation : relations)
+            {
+                auto orders = impl->sqlite.query_s<Order>("id = ?", relation.order_id);
+                if (!orders.empty())
+                {
+                    out_orders.push_back(orders[0]);
+                }
+            }
+            
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get orders by file failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_order_file_relations(int order_id, std::vector<OrderFile> &out_relations)
+    {
+        try
+        {
+            out_relations = impl->sqlite.query_s<OrderFile>("order_id = ?", order_id);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get order-file relations failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_file_order_relations(const std::string& file_uuid, std::vector<OrderFile> &out_relations)
+    {
+        try
+        {
+            out_relations = impl->sqlite.query_s<OrderFile>("file_uuid = ?", file_uuid);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get file-order relations failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::update_order_file_relation(int order_id, const std::string& file_uuid, const std::string& description)
+    {
+        try
+        {
+            auto relations = impl->sqlite.query_s<OrderFile>("order_id = ? AND file_uuid = ?", order_id, file_uuid);
+            if (relations.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+
+            OrderFile relation = relations[0];
+            relation.description = description;
+            
+            impl->sqlite.update(relation);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Update order-file relation failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_order_file_relation_count(int order_id, int &out_count)
+    {
+        try
+        {
+            auto relations = impl->sqlite.query_s<OrderFile>("order_id = ?", order_id);
+            out_count = static_cast<int>(relations.size());
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get order-file relation count failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::get_file_order_relation_count(const std::string& file_uuid, int &out_count)
+    {
+        try
+        {
+            auto relations = impl->sqlite.query_s<OrderFile>("file_uuid = ?", file_uuid);
+            out_count = static_cast<int>(relations.size());
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Get file-order relation count failed: " << e.what() << std::endl;
             return DB_ERROR_SQL_EXECUTION;
         }
     }
@@ -2011,7 +2292,8 @@ namespace lmdb {
     {
         try
         {
-            impl->sqlite.delete_records<Gcode_file>();
+            impl->sqlite.delete_records<OrderFile>();
+            impl->sqlite.delete_records<File_record>();
             impl->sqlite.delete_records<PrintTask>();
             impl->sqlite.delete_records<Order>();
             impl->sqlite.delete_records<Customer>();
@@ -2052,9 +2334,9 @@ namespace lmdb {
         std::cout << "Completed print tasks: " << completed << std::endl;
         }
 
-        std::vector<Gcode_file> gcode_files;
-        if (get_all_gcode_files(gcode_files) == DB_SUCCESS) {
-        std::cout << "G-code file count: " << gcode_files.size() << std::endl;
+        std::vector<File_record> file_records;
+        if (get_all_file_records(file_records) == DB_SUCCESS) {
+        std::cout << "File record count: " << file_records.size() << std::endl;
         }
 
         std::cout << "===============================================\n\n";
@@ -2263,7 +2545,7 @@ namespace lmdb {
             std::cout << "Adding test users...\n";
             
             // Admin user (role = 4)
-            add_user("admin", "admin@lightmaker.local", "admin123", "+86-10-12345678", "LightMaker HQ", ADMIN);
+            add_user("admin", "admin@lightmaker.local", "123", "+86-10-12345678", "LightMaker HQ", ADMIN);
             
             // Manager user (role = 3)
             add_user("manager1", "manager1@lightmaker.local", "mgr123", "+86-10-12345679", "Management Office", MANAGER);
@@ -2298,11 +2580,11 @@ namespace lmdb {
             
             // Add test print tasks
             std::cout << "Adding test print tasks...\n";
-            add_print_task(1, "Part A - Prototype", "part_a_proto.gcode", 5);
-            add_print_task(1, "Part B - Prototype", "part_b_proto.gcode", 3);
-            add_print_task(2, "Part A - Production", "part_a_prod.gcode", 100);
-            add_print_task(3, "Custom Part 1", "custom_part1.gcode", 10);
-            add_print_task(4, "Sample 1", "sample1.gcode", 2);
+            add_print_task("ORD202412011200001", "Part A - Prototype", "part_a_proto.gcode", 5);
+            add_print_task("ORD202412011200001", "Part B - Prototype", "part_b_proto.gcode", 3);
+            add_print_task("ORD202412011200002", "Part A - Production", "part_a_prod.gcode", 100);
+            add_print_task("ORD202412011200003", "Custom Part 1", "custom_part1.gcode", 10);
+            add_print_task("ORD202412011200004", "Sample 1", "sample1.gcode", 2);
             
             // Update some print progress
             update_print_progress(1, 3); // Part A - Prototype: 3/5 completed
@@ -2337,9 +2619,9 @@ namespace lmdb {
             std::string key2 = bytesToHex(key2_bytes);
             std::string key3 = bytesToHex(key3_bytes);
             
-            add_gcode_file("part_a_proto.gcode", "./enc_resource/part_a_proto.enc", key1);
-            add_gcode_file("part_b_proto.gcode", "./enc_resource/part_b_proto.enc", key2);
-            add_gcode_file("custom_part1.gcode", "./enc_resource/custom_part1.enc", key3);
+            add_file_record("part_a_proto.gcode", "./enc_resource/part_a_proto.enc", key1, 1, "gcode");
+            add_file_record("part_b_proto.gcode", "./enc_resource/part_b_proto.enc", key2, 1, "gcode");
+            add_file_record("custom_part1.gcode", "./enc_resource/custom_part1.enc", key3, 2, "gcode");
             
             std::cout << "Test data populated successfully!\n";
             std::cout << "Generated AES keys:\n";
@@ -2376,23 +2658,85 @@ namespace lmdb {
             std::cout << "\n2. Sample G-code file info:\n";
             std::cout << lm::gcode::GCodeProcessor::getGCodeFileInfo(sample_gcode_path) << std::endl;
             
-            // Test encryption with random password
-            std::cout << "3. Testing encryption with random password...\n";
+            // Test encryption with random password using new interface
+            std::cout << "3. Testing encryption with random password using new interface...\n";
             
-            // Generate random password
-            auto random_key = lm::crypto::AESEncryption::generateRandomKey();
+            // Generate random password using new interface
+            std::vector<uint8_t> random_key;
+            DB_RESULT key_gen_result = lmDBCore::generate_random_aes_key(random_key);
             std::string password = bytesToHex(random_key);
             std::cout << "   Generated random password: " << password.substr(0, 16) << "..." << std::endl;
             
-            // Create processor with random password
-            lm::gcode::GCodeProcessor processor(password);
+            // Read G-code file data into memory
+            std::ifstream file(sample_gcode_path, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "   ✗ Failed to open sample G-code file" << std::endl;
+                return;
+            }
             
-            if (processor.encryptGCodeFile(sample_gcode_path, encrypted_path)) {
-                std::cout << "   ✓ Encryption successful: " << encrypted_path << std::endl;
+            std::vector<uint8_t> file_data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            file.close();
+            
+            // Test encryption using new data stream to file interface
+            DB_RESULT encrypt_result = lmDBCore::encrypt_file_with_key(file_data, random_key, encrypted_path);
+            if (encrypt_result == DB_SUCCESS) {
+                std::cout << "   ✓ Encryption successful, data written to: " << encrypted_path << std::endl;
+                
+                // Test chunked encryption
+                std::cout << "\n5. Testing chunked encryption...\n";
+                std::string chunked_encrypted_path = "./data/test_sample_chunked.gcode.enc";
+                
+                // Split data into chunks and encrypt each chunk
+                size_t chunk_size = file_data.size() / 3;  // Split into 3 chunks
+                if (chunk_size == 0) chunk_size = 1;
+                
+                for (int i = 0; i < 3; ++i) {
+                    size_t start = i * chunk_size;
+                    size_t end = (i == 2) ? file_data.size() : (i + 1) * chunk_size;
+                    
+                    std::vector<uint8_t> chunk_data(file_data.begin() + start, file_data.begin() + end);
+                    bool append_mode = (i > 0);  // First chunk overwrites, others append
+                    
+                    DB_RESULT chunk_result = lmDBCore::encrypt_file_with_key(chunk_data, random_key, chunked_encrypted_path, i, append_mode);
+                    if (chunk_result == DB_SUCCESS) {
+                        std::cout << "   ✓ Chunk " << i << " encrypted successfully (size: " << chunk_data.size() << " bytes)" << std::endl;
+                    } else {
+                        std::cout << "   ✗ Chunk " << i << " encryption failed" << std::endl;
+                    }
+                }
+                
+                // Test decryption of chunked file
+                std::cout << "\n6. Testing chunked decryption...\n";
+                std::vector<uint8_t> decrypted_chunked_data;
+                DB_RESULT decrypt_chunked_result = lmDBCore::decrypt_file_with_key(chunked_encrypted_path, random_key, decrypted_chunked_data);
+                if (decrypt_chunked_result == DB_SUCCESS) {
+                    std::cout << "   ✓ Chunked decryption successful, data size: " << decrypted_chunked_data.size() << " bytes" << std::endl;
+                    
+                    // Verify data integrity
+                    if (decrypted_chunked_data == file_data) {
+                        std::cout << "   ✓ Data integrity verified - chunked data matches original" << std::endl;
+                    } else {
+                        std::cout << "   ✗ Data integrity check failed - chunked data differs from original" << std::endl;
+                    }
+                } else {
+                    std::cout << "   ✗ Chunked decryption failed" << std::endl;
+                }
+                
+                // Test individual chunk decryption
+                std::cout << "\n7. Testing individual chunk decryption...\n";
+                for (int i = 0; i < 3; ++i) {
+                    std::vector<uint8_t> chunk_data;
+                    DB_RESULT chunk_decrypt_result = lmDBCore::decrypt_file_chunk(chunked_encrypted_path, random_key, i, chunk_data);
+                    if (chunk_decrypt_result == DB_SUCCESS) {
+                        std::cout << "   ✓ Chunk " << i << " decrypted successfully (size: " << chunk_data.size() << " bytes)" << std::endl;
+                    } else {
+                        std::cout << "   ✗ Chunk " << i << " decryption failed" << std::endl;
+                    }
+                }
                 
                 // Store G-code file info in database
                 std::cout << "   Storing G-code info in database...\n";
-                bool db_success = add_gcode_file("test_sample.gcode", encrypted_path, password);
+                bool db_success = add_file_record("test_sample.gcode", encrypted_path, password, 1, "gcode");
                 if (db_success) {
                     std::cout << "   ✓ G-code info stored in database successfully\n";
                 } else {
@@ -2403,38 +2747,65 @@ namespace lmdb {
                 return;
             }
             
-            // Test decryption using password from database
-            std::cout << "\n4. Testing decryption using password from database...\n";
+            // Test decryption using password from database with new interface
+            std::cout << "\n4. Testing decryption using password from database with new interface...\n";
             
-            // Get G-code file info from database by filename
-            Gcode_file test_file;
-            if (get_gcode_file_by_filename("test_sample.gcode", test_file) != DB_SUCCESS) {
+            //  
+            std::vector<File_record> all_files;
+            if (get_all_file_records(all_files) != DB_SUCCESS || all_files.empty()) {
+                std::cerr << "   ✗ Test G-code file not found in database" << std::endl;
+                return;
+            }
+             
+            File_record test_file;
+            bool found = false;
+            for (const auto& file : all_files) {
+                if (file.filename == "test_sample.gcode") {
+                    test_file = file;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
                 std::cerr << "   ✗ Test G-code file not found in database" << std::endl;
                 return;
             }
             
             std::cout << "   Retrieved password from database: " << test_file.aeskey.substr(0, 16) << "..." << std::endl;
             
-            // Create new processor with password from database
-            lm::gcode::GCodeProcessor db_processor(test_file.aeskey);
+            // Convert password string back to key
+            std::vector<uint8_t> db_key = hexToBytes(test_file.aeskey);
             
-            if (db_processor.decryptGCodeFile(encrypted_path, decrypted_path)) {
-                std::cout << "   ✓ Decryption successful using database password: " << decrypted_path << std::endl;
+            // Test decryption using new file to data stream interface
+            std::vector<uint8_t> decrypted_data;
+            DB_RESULT decrypt_result = lmDBCore::decrypt_file_with_key(encrypted_path, db_key, decrypted_data);
+            if (decrypt_result == DB_SUCCESS) {
+                std::cout << "   ✓ Decryption successful, data size: " << decrypted_data.size() << " bytes" << std::endl;
+                
+                // Write decrypted data to file
+                std::ofstream out_file(decrypted_path, std::ios::binary);
+                if (out_file.is_open()) {
+                    out_file.write(reinterpret_cast<const char*>(decrypted_data.data()), decrypted_data.size());
+                    out_file.close();
+                    std::cout << "   ✓ Decrypted data written to: " << decrypted_path << std::endl;
+                }
             } else {
                 std::cerr << "   ✗ Decryption failed" << std::endl;
                 return;
             }
             
-            // Verify decrypted file
+            // Verify decrypted file by comparing with original
             std::cout << "\n5. Verifying decrypted file...\n";
-            if (lm::gcode::GCodeProcessor::validateGCodeFile(decrypted_path)) {
-                std::cout << "   ✓ Decrypted file is valid G-code" << std::endl;
+            if (decrypted_data == file_data) {
+                std::cout << "   ✓ Decrypted data matches original data" << std::endl;
             } else {
-                std::cerr << "   ✗ Decrypted file is not valid G-code" << std::endl;
+                std::cerr << "   ✗ Decrypted data does not match original data" << std::endl;
                 return;
             }
             
-            
+            // Test additional new interfaces
+            std::cout << "\n6. Testing additional new interfaces...\n";
         } catch (const std::exception& e) {
             std::cerr << "G-code encryption/decryption test error: " << e.what() << std::endl;
         }
@@ -2448,7 +2819,7 @@ namespace lmdb {
         try
         {
             // Validate input parameters
-            if (task.order_id <= 0) {
+            if (task.order_serial_number.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
@@ -2456,7 +2827,7 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (task.gcode_filename.empty()) {
+            if (task.file_uuid.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
@@ -2489,7 +2860,7 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (task.order_id <= 0) {
+            if (task.order_serial_number.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
@@ -2497,7 +2868,7 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (task.gcode_filename.empty()) {
+            if (task.file_uuid.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
@@ -2526,14 +2897,11 @@ namespace lmdb {
         }
     }
 
-    // ==================== Gcode_file 结构体接口 ====================
-
-    // 新增：传入Gcode_file结构体的add_gcode_file接口
-    DB_RESULT lmDBCore::add_gcode_file(Gcode_file &file)
+ 
+    DB_RESULT lmDBCore::add_file_record(File_record &file)
     {
         try
         {
-            // Validate input parameters
             if (file.filename.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
@@ -2546,11 +2914,17 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            // Check if file already exists
-            auto existing = impl->sqlite.query_s<Gcode_file>("filename = ?", file.filename);
+            // Always generate a new UUID for the file
+            DB_RESULT uuid_result = lmDBCore::generate_uuid(file.uuid);
+            if (uuid_result != DB_SUCCESS) {
+                return uuid_result;
+            }
+            
+            // Check if UUID already exists
+            auto existing = impl->sqlite.query_s<File_record>("uuid = ?", file.uuid);
             if (!existing.empty())
             {
-                return DB_ERROR_DUPLICATE_RECORD; // File already exists
+                return DB_ERROR_DUPLICATE_RECORD; // UUID already exists
             }
 
             // Set default timestamp if not provided
@@ -2568,42 +2942,23 @@ namespace lmdb {
         }
     }
 
-    // 新增：传入Gcode_file结构体的update_gcode_file接口
-    DB_RESULT lmDBCore::update_gcode_file(const Gcode_file &file)
+    // 新增：传入File_record结构体的update_file_record接口
+    DB_RESULT lmDBCore::update_file_record(const File_record &file)
     {
         try
         {
-            // Validate input parameters
-            if (file.id <= 0) {
+       
+            if (file.uuid.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (file.filename.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            if (file.encrypted_path.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            if (file.aeskey.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
-            
-            // Check if file exists
-            auto existing = impl->sqlite.query_s<Gcode_file>("id = ?", file.id);
+            auto existing = impl->sqlite.query_s<File_record>("uuid = ?", file.uuid);
             if (existing.empty())
             {
                 return DB_ERROR_RECORD_NOT_FOUND;
             }
 
-            // Check if new filename conflicts with existing files (excluding current file)
-            auto name_conflict = impl->sqlite.query_s<Gcode_file>("filename = ? AND id != ?", file.filename, file.id);
-            if (!name_conflict.empty())
-            {
-                return DB_ERROR_DUPLICATE_RECORD; // Filename already exists
-            }
-            
+     
             impl->sqlite.update(file);
             return DB_SUCCESS;
         }
@@ -2711,6 +3066,18 @@ namespace lmdb {
             DB_RESULT set_pwd_result = set_password("updated_user1", "newpassword123");
             std::cout << "      - Set user password: " << (set_pwd_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
+            // Test update user role by name
+            std::cout << "   2.8 Test update_user_role_by_name():\n";
+            
+            // Test valid role update
+            DB_RESULT update_role_result1 = update_user_role_by_name("updated_user1", static_cast<int>(USER_ROLE::MANAGER));
+            std::cout << "      - Update user role to MANAGER: " << (update_role_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test invalid role update
+            DB_RESULT update_role_result2 = update_user_role_by_name("updated_user1", 99);  // Invalid role
+            std::cout << "      - Update user role to invalid value (99): " << (update_role_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+  
             // ========== Customer Management Test Cases ==========
             std::cout << "\n3. Customer Management Function Test Cases:\n";
             
@@ -2822,10 +3189,10 @@ namespace lmdb {
             
             // Test add print task
             std::cout << "   6.1 Test add_print_task():\n";
-            DB_RESULT add_task_result1 = add_print_task(1, "Print Task 1", "task1.gcode", 100);
+            DB_RESULT add_task_result1 = add_print_task("ORD202412011200001", "Print Task 1", "task1.gcode", 100);
             std::cout << "      - Add print task 1: " << (add_task_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            DB_RESULT add_task_result2 = add_print_task(2, "Print Task 2", "task2.gcode", 200);
+            DB_RESULT add_task_result2 = add_print_task("ORD202412011200002", "Print Task 2", "task2.gcode", 200);
             std::cout << "      - Add print task 2: " << (add_task_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // Test get print task
@@ -2842,7 +3209,7 @@ namespace lmdb {
             // Test get print tasks by order
             std::cout << "   6.4 Test get_print_tasks_by_order():\n";
             std::vector<PrintTask> order_tasks;
-            DB_RESULT get_tasks_by_order_result = get_print_tasks_by_order(1, order_tasks);
+            DB_RESULT get_tasks_by_order_result = get_print_tasks_by_order("ORD202412011200001", order_tasks);
             std::cout << "      - Get order 1 print tasks count: " << (get_tasks_by_order_result == DB_SUCCESS ? std::to_string(order_tasks.size()) : "FAILED") << " tasks" << std::endl;
             
             // Test update print task
@@ -2860,38 +3227,134 @@ namespace lmdb {
             std::cout << "\n7. G-code File Management Function Test Cases:\n";
             
             // Test add G-code file
-            std::cout << "   7.1 Test add_gcode_file():\n";
+            std::cout << "   7.1 Test add_file_record():\n";
             std::string test_key1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-            DB_RESULT add_gcode_result1 = add_gcode_file("test1.gcode", "./enc/test1.enc", test_key1);
-            std::cout << "      - Add G-code file 1: " << (add_gcode_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            DB_RESULT add_file_result1 = add_file_record("test1.gcode", "./enc/test1.enc", test_key1, 1, "gcode");
+            std::cout << "      - Add file record 1: " << (add_file_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             std::string test_key2 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-            DB_RESULT add_gcode_result2 = add_gcode_file("test2.gcode", "./enc/test2.enc", test_key2);
-            std::cout << "      - Add G-code file 2: " << (add_gcode_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            DB_RESULT add_file_result2 = add_file_record("test2.gcode", "./enc/test2.enc", test_key2, 2, "gcode");
+            std::cout << "      - Add file record 2: " << (add_file_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            // Test get G-code file
-            std::cout << "   7.2 Test get_gcode_file_by_filename():\n";
-            Gcode_file gcode1;
-            DB_RESULT get_gcode_result = get_gcode_file_by_filename("test1.gcode", gcode1);
-            std::cout << "      - Get G-code file 1: " << (get_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            // Test get file record
+            std::cout << "   7.2 Test get_file_record():\n";
+            // 
+            std::vector<File_record> all_files;
+            DB_RESULT get_all_result = get_all_file_records(all_files);
+            File_record file1;
+            DB_RESULT get_file_result = DB_ERROR_RECORD_NOT_FOUND;
+            if (get_all_result == DB_SUCCESS) {
+                for (const auto& file : all_files) {
+                    if (file.filename == "test1.gcode") {
+                        file1 = file;
+                        get_file_result = DB_SUCCESS;
+                        break;
+                    }
+                }
+            }
+            std::cout << "      - Get file record 1: " << (get_file_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            // Test update G-code file
-            std::cout << "   7.3 Test update_gcode_file():\n";
+            // Test UUID-based operations
+            std::cout << "   7.2.1 Test UUID-based operations:\n";
+            std::cout << "      - Generated UUID: " << file1.uuid << std::endl;
+            
+            // Test get by UUID
+            File_record file_by_uuid;
+            DB_RESULT get_by_uuid_result = get_file_record(file1.uuid, file_by_uuid);
+            std::cout << "      - Get file record by UUID: " << (get_by_uuid_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test update file record
+            std::cout << "   7.3 Test update_file_record():\n";
             std::string new_key = "1111111111111111111111111111111111111111111111111111111111111111";
-            DB_RESULT update_gcode_result = update_gcode_file("test1.gcode", "updated_test1.gcode", "./enc/updated_test1.enc", new_key);
-            std::cout << "      - Update G-code file 1: " << (update_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            DB_RESULT update_file_result = update_file_record(file1.uuid, "updated_test1.gcode", "./enc/updated_test1.enc", new_key, 1, "gcode");
+            std::cout << "      - Update file record 1: " << (update_file_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            // Test get all G-code files
-            std::cout << "   7.4 Test get_all_gcode_files():\n";
-            std::vector<Gcode_file> all_gcode_files;
-            DB_RESULT get_all_gcode_result = get_all_gcode_files(all_gcode_files);
-            std::cout << "      - Get all G-code files count: " << (get_all_gcode_result == DB_SUCCESS ? std::to_string(all_gcode_files.size()) : "FAILED") << " files" << std::endl;
+            
+            // Test get all file records
+            std::cout << "   7.4 Test get_all_file_records():\n";
+            std::vector<File_record> all_file_records;
+            DB_RESULT get_all_files_result = get_all_file_records(all_file_records);
+            std::cout << "      - Get all file records count: " << (get_all_files_result == DB_SUCCESS ? std::to_string(all_file_records.size()) : "FAILED") << " files" << std::endl;
             
             // Test get total G-code files count
-            std::cout << "   7.5 Test get_total_gcode_files_count():\n";
-            int gcode_count = 0;
-            DB_RESULT get_gcode_count_result = get_total_gcode_files_count(gcode_count);
-            std::cout << "      - Total G-code files count: " << (get_gcode_count_result == DB_SUCCESS ? std::to_string(gcode_count) : "FAILED") << " files" << std::endl;
+            std::cout << "   7.5 Test get_total_file_records_count():\n";
+            int file_count = 0;
+            DB_RESULT get_file_count_result = get_total_file_records_count(file_count);
+            std::cout << "      - Total file records count: " << (get_file_count_result == DB_SUCCESS ? std::to_string(file_count) : "FAILED") << " files" << std::endl;
+            
+            // Test get file records by customer
+            std::cout << "   7.6 Test get_file_records_by_customer():\n";
+            std::vector<File_record> customer1_files;
+            DB_RESULT get_customer1_result = get_file_records_by_customer(1, customer1_files);
+            std::cout << "      - Customer 1 files count: " << (get_customer1_result == DB_SUCCESS ? std::to_string(customer1_files.size()) : "FAILED") << " files" << std::endl;
+            
+            std::vector<File_record> customer2_files;
+            DB_RESULT get_customer2_result = get_file_records_by_customer(2, customer2_files);
+            std::cout << "      - Customer 2 files count: " << (get_customer2_result == DB_SUCCESS ? std::to_string(customer2_files.size()) : "FAILED") << " files" << std::endl;
+            
+            // Test get file records count by customer
+            std::cout << "   7.7 Test get_file_records_count_by_customer():\n";
+            int customer1_count = 0;
+            DB_RESULT get_customer1_count_result = get_file_records_count_by_customer(1, customer1_count);
+            std::cout << "      - Customer 1 files count: " << (get_customer1_count_result == DB_SUCCESS ? std::to_string(customer1_count) : "FAILED") << " files" << std::endl;
+            
+            int customer2_count = 0;
+            DB_RESULT get_customer2_count_result = get_file_records_count_by_customer(2, customer2_count);
+            std::cout << "      - Customer 2 files count: " << (get_customer2_count_result == DB_SUCCESS ? std::to_string(customer2_count) : "FAILED") << " files" << std::endl;
+            
+            // Test UUID generation
+            std::cout << "   7.8 Test generate_uuid():\n";
+            std::string test_uuid;
+            DB_RESULT uuid_gen_result = lmDBCore::generate_uuid(test_uuid);
+            std::cout << "      - Generate UUID: " << (uuid_gen_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            if (uuid_gen_result == DB_SUCCESS) {
+                std::cout << "      - Generated UUID: " << test_uuid << std::endl;
+            }
+            
+            // Test Order-File relationship operations
+            std::cout << "   7.9 Test Order-File relationship operations:\n";
+            
+            // Create test order first
+            Order test_order;
+            test_order.name = "Test Order for File Relations";
+            test_order.serial_number = "ORD-FILE-001";
+            test_order.description = "Test order for file relationship testing";
+            test_order.print_quantity = 100;
+            test_order.customer_id = 1;
+            test_order.created_at = time(0);
+            test_order.updated_at = time(0);
+            
+            DB_RESULT add_order_result = add_order(test_order);
+            std::cout << "      - Add test order: " << (add_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            if (add_order_result == DB_SUCCESS) {
+                // Test add order-file relation
+                DB_RESULT add_relation_result = add_order_file_relation(test_order.id, file1.uuid, "Main GCode file for order");
+                std::cout << "      - Add order-file relation: " << (add_relation_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+                
+                // Test get files by order
+                std::vector<File_record> order_files;
+                DB_RESULT get_files_result = get_files_by_order(test_order.id, order_files);
+                std::cout << "      - Get files by order: " << (get_files_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << " (" << order_files.size() << " files)" << std::endl;
+                
+                // Test get orders by file
+                std::vector<Order> file_orders;
+                DB_RESULT get_orders_result = get_orders_by_file(file1.uuid, file_orders);
+                std::cout << "      - Get orders by file: " << (get_orders_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << " (" << file_orders.size() << " orders)" << std::endl;
+                
+                // Test get relation count
+                int relation_count = 0;
+                DB_RESULT get_count_result = get_order_file_relation_count(test_order.id, relation_count);
+                std::cout << "      - Get order-file relation count: " << (get_count_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << " (" << relation_count << " relations)" << std::endl;
+                
+                // Test update relation description
+                DB_RESULT update_relation_result = update_order_file_relation(test_order.id, file1.uuid, "Updated description for main file");
+                std::cout << "      - Update order-file relation: " << (update_relation_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+                
+                // Test remove order-file relation
+                DB_RESULT remove_relation_result = remove_order_file_relation(test_order.id, file1.uuid);
+                std::cout << "      - Remove order-file relation: " << (remove_relation_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            }
             
             // ========== Statistics Function Test Cases ==========
             std::cout << "\n8. Statistics Function Test Cases:\n";
@@ -2934,9 +3397,10 @@ namespace lmdb {
             DB_RESULT remove_task_result = remove_print_task(1);
             std::cout << "      - Remove print task 1: " << (remove_task_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            std::cout << "   9.6 Test remove_gcode_file():\n";
-            DB_RESULT remove_gcode_result = remove_gcode_file("updated_test1.gcode");
-            std::cout << "      - Remove G-code file 1: " << (remove_gcode_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            std::cout << "   9.6 Test remove_file_record():\n";
+            DB_RESULT remove_file_result = remove_file_record(file1.uuid);
+            std::cout << "      - Remove file record 1: " << (remove_file_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
             
             // ========== Database Status Test ==========
             std::cout << "\n10. Database Status Test:\n";
@@ -3017,4 +3481,298 @@ namespace lmdb {
     {
         return getUserDataDirectory() + "/data";
     }
+
+
+    DB_RESULT lmDBCore::encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& output_path, int chunk_index, bool append_mode)
+    {
+        try
+        {
+            lm::crypto::AESEncryption encryption(key);
+            std::vector<uint8_t> encrypted_data = encryption.encrypt(input_data);
+            
+            // Create chunk header
+            struct ChunkHeader {
+                uint32_t magic;        // Magic number: 0x4C4D4348 ("LMCH")
+                uint32_t chunk_index;  // Chunk index
+                uint32_t data_size;    // Encrypted data size
+                uint32_t checksum;     // Simple checksum
+            };
+            
+            ChunkHeader header;
+            header.magic = 0x4C4D4348;  // "LMCH"
+            header.chunk_index = chunk_index;
+            header.data_size = static_cast<uint32_t>(encrypted_data.size());
+            
+            // Calculate simple checksum
+            uint32_t checksum = 0;
+            for (size_t i = 0; i < encrypted_data.size(); ++i) {
+                checksum += encrypted_data[i];
+            }
+            header.checksum = checksum;
+            
+            // Open file in appropriate mode
+            std::ios_base::openmode mode = std::ios::binary;
+            if (append_mode) {
+                mode |= std::ios::app;
+            }
+            
+            std::ofstream out_file(output_path, mode);
+            if (!out_file.is_open()) {
+                std::cerr << "Failed to open output file: " << output_path << std::endl;
+                return DB_ERROR_SQL_EXECUTION;
+            }
+            
+            // Write chunk header
+            out_file.write(reinterpret_cast<const char*>(&header), sizeof(ChunkHeader));
+            
+            // Write encrypted data
+            out_file.write(reinterpret_cast<const char*>(encrypted_data.data()), encrypted_data.size());
+            
+            out_file.close();
+            
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Encrypt file data with key failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::decrypt_file_with_key(const std::string& input_path, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data)
+    {
+        try
+        {
+            output_data.clear();
+            
+            // Read encrypted file data
+            std::ifstream in_file(input_path, std::ios::binary);
+            if (!in_file.is_open()) {
+                std::cerr << "Failed to open input file: " << input_path << std::endl;
+                return DB_ERROR_SQL_EXECUTION;
+            }
+            
+            // Get file size
+            in_file.seekg(0, std::ios::end);
+            size_t file_size = in_file.tellg();
+            in_file.seekg(0, std::ios::beg);
+            
+            // Check if file has chunk headers (new format) or is legacy format
+            if (file_size >= 16) {  // Minimum size for chunk header
+                // Try to read first chunk header
+                struct ChunkHeader {
+                    uint32_t magic;
+                    uint32_t chunk_index;
+                    uint32_t data_size;
+                    uint32_t checksum;
+                };
+                
+                ChunkHeader header;
+                in_file.read(reinterpret_cast<char*>(&header), sizeof(ChunkHeader));
+                
+                if (header.magic == 0x4C4D4348) {  // "LMCH" - new chunked format
+                    // Reset to beginning and decrypt all chunks
+                    in_file.seekg(0, std::ios::beg);
+                    
+                    lm::crypto::AESEncryption encryption(key);
+                    
+                    while (in_file.tellg() < static_cast<std::streampos>(file_size)) {
+                        // Read chunk header
+                        in_file.read(reinterpret_cast<char*>(&header), sizeof(ChunkHeader));
+                        if (in_file.gcount() != sizeof(ChunkHeader)) {
+                            break;  // End of file or error
+                        }
+                        
+                        // Read encrypted data
+                        std::vector<uint8_t> chunk_data(header.data_size);
+                        in_file.read(reinterpret_cast<char*>(chunk_data.data()), header.data_size);
+                        
+                        if (in_file.gcount() != static_cast<std::streamsize>(header.data_size)) {
+                            std::cerr << "Failed to read chunk data" << std::endl;
+                            return DB_ERROR_SQL_EXECUTION;
+                        }
+                        
+                        // Verify checksum
+                        uint32_t calculated_checksum = 0;
+                        for (size_t i = 0; i < chunk_data.size(); ++i) {
+                            calculated_checksum += chunk_data[i];
+                        }
+                        
+                        if (calculated_checksum != header.checksum) {
+                            std::cerr << "Chunk checksum verification failed" << std::endl;
+                            return DB_ERROR_SQL_EXECUTION;
+                        }
+                        
+                        // Decrypt chunk and append to output
+                        std::vector<uint8_t> decrypted_chunk = encryption.decrypt(chunk_data);
+                        output_data.insert(output_data.end(), decrypted_chunk.begin(), decrypted_chunk.end());
+                    }
+                } else {
+                    // Legacy format - decrypt entire file
+                    in_file.seekg(0, std::ios::beg);
+                    std::vector<uint8_t> encrypted_data(file_size);
+                    in_file.read(reinterpret_cast<char*>(encrypted_data.data()), file_size);
+                    
+                    lm::crypto::AESEncryption encryption(key);
+                    output_data = encryption.decrypt(encrypted_data);
+                }
+            } else {
+                // File too small, treat as legacy format
+                std::vector<uint8_t> encrypted_data(file_size);
+                in_file.read(reinterpret_cast<char*>(encrypted_data.data()), file_size);
+                
+                lm::crypto::AESEncryption encryption(key);
+                output_data = encryption.decrypt(encrypted_data);
+            }
+            
+            in_file.close();
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Decrypt file with key failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::decrypt_file_chunk(const std::string& input_path, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data)
+    {
+        try
+        {
+            output_data.clear();
+            
+            // Read encrypted file data
+            std::ifstream in_file(input_path, std::ios::binary);
+            if (!in_file.is_open()) {
+                std::cerr << "Failed to open input file: " << input_path << std::endl;
+                return DB_ERROR_SQL_EXECUTION;
+            }
+            
+            // Get file size
+            in_file.seekg(0, std::ios::end);
+            size_t file_size = in_file.tellg();
+            in_file.seekg(0, std::ios::beg);
+            
+            lm::crypto::AESEncryption encryption(key);
+            
+            // Find the specified chunk
+            while (in_file.tellg() < static_cast<std::streampos>(file_size)) {
+                struct ChunkHeader {
+                    uint32_t magic;
+                    uint32_t chunk_index;
+                    uint32_t data_size;
+                    uint32_t checksum;
+                };
+                
+                ChunkHeader header;
+                in_file.read(reinterpret_cast<char*>(&header), sizeof(ChunkHeader));
+                if (in_file.gcount() != sizeof(ChunkHeader)) {
+                    break;  // End of file or error
+                }
+                
+                if (header.magic != 0x4C4D4348) {  // "LMCH"
+                    std::cerr << "Invalid chunk header magic" << std::endl;
+                    return DB_ERROR_SQL_EXECUTION;
+                }
+                
+                if (header.chunk_index == static_cast<uint32_t>(chunk_index)) {
+                    // Found the target chunk
+                    std::vector<uint8_t> chunk_data(header.data_size);
+                    in_file.read(reinterpret_cast<char*>(chunk_data.data()), header.data_size);
+                    
+                    if (in_file.gcount() != static_cast<std::streamsize>(header.data_size)) {
+                        std::cerr << "Failed to read chunk data" << std::endl;
+                        return DB_ERROR_SQL_EXECUTION;
+                    }
+                    
+                    // Verify checksum
+                    uint32_t calculated_checksum = 0;
+                    for (size_t i = 0; i < chunk_data.size(); ++i) {
+                        calculated_checksum += chunk_data[i];
+                    }
+                    
+                    if (calculated_checksum != header.checksum) {
+                        std::cerr << "Chunk checksum verification failed" << std::endl;
+                        return DB_ERROR_SQL_EXECUTION;
+                    }
+                    
+                    // Decrypt chunk
+                    output_data = encryption.decrypt(chunk_data);
+                    in_file.close();
+                    return DB_SUCCESS;
+                } else {
+                    // Skip this chunk
+                    in_file.seekg(header.data_size, std::ios::cur);
+                }
+            }
+            
+            in_file.close();
+            return DB_ERROR_RECORD_NOT_FOUND;  // Chunk not found
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Decrypt file chunk failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::generate_random_aes_key(std::vector<uint8_t>& out_key)
+    {
+        try
+        {
+            out_key = lm::crypto::AESEncryption::generateRandomKey();
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Generate random AES key failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    DB_RESULT lmDBCore::generate_uuid(std::string& out_uuid)
+    {
+        try
+        {
+            // Generate random UUID using OpenSSL RAND_bytes
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, 15);
+            std::uniform_int_distribution<> dis2(8, 11);
+            
+            std::stringstream ss;
+            int i;
+            ss << std::hex;
+            for (i = 0; i < 8; i++) {
+                ss << dis(gen);
+            }
+            ss << "-";
+            for (i = 0; i < 4; i++) {
+                ss << dis(gen);
+            }
+            ss << "-4";
+            for (i = 0; i < 3; i++) {
+                ss << dis(gen);
+            }
+            ss << "-";
+            ss << dis2(gen);
+            for (i = 0; i < 3; i++) {
+                ss << dis(gen);
+            }
+            ss << "-";
+            for (i = 0; i < 12; i++) {
+                ss << dis(gen);
+            }
+            
+            out_uuid = ss.str();
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Generate UUID failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+
 }
