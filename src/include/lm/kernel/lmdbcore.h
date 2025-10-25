@@ -104,13 +104,13 @@ struct Order
     std::string description;       // Order description
     std::string attachments;       // JSON string of attachments array
     int32_t print_quantity;        // Print quantity
-    int64_t customer_id;           // Associated customer ID (int64_t)
+    std::string customer_name;     // Associated customer name
     int64_t created_at;            // Creation timestamp
     int64_t updated_at;            // Update timestamp
 
     Order() = default;
-    Order(const std::string &name, const std::string &desc = "", int64_t customer_id = 0, int32_t quantity = 1)
-        : name(name), description(desc), customer_id(customer_id), print_quantity(quantity) {
+    Order(const std::string &name, const std::string &desc = "", const std::string &customer_name = "", int32_t quantity = 1)
+        : name(name), description(desc), customer_name(customer_name), print_quantity(quantity) {
         // Set default timestamps
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -194,17 +194,16 @@ struct PrintTask
           total_quantity(total), completed_quantity(0) {}
 };
 
-// gcode 文件 
+// 
 struct File_record
 {
   int id;
   std::string uuid;              // 
   std::string filename;          // 
-  std::string encrypted_path;    //  
   std::string aeskey;            //  
   std::string upload_time;       //  
   std::string file_type;         // (gcode, stl, etc.)
-  int customer_id;               // 
+  std::string customer_name;     // Customer name instead of customer_id
 };
 
 // Order File_record mapping
@@ -273,20 +272,20 @@ namespace lmdb
 
 
         // Order operations
-        DB_RESULT add_order(const std::string &name, const std::string &description, int64_t customer_id,
-                       int32_t print_quantity = 1, const std::string &attachments = "");
-        DB_RESULT add_order(Order &order);  // 新增：传入Order结构体的接口
+        DB_RESULT add_order(const std::string &name, const std::string &description, const std::string &customer_name,
+                       int32_t print_quantity, const std::string &attachments, std::string &out_serial_number);
+        DB_RESULT add_order(Order &order, std::string &out_serial_number);  // 新增：传入Order结构体的接口，返回序列号
         DB_RESULT remove_order(int64_t order_id);
         DB_RESULT remove_order(const std::string &serial_number);
         DB_RESULT update_order(int64_t order_id, const std::string &name, const std::string &description,
-        int64_t customer_id, int32_t print_quantity, const std::string &attachments);
+        const std::string &customer_name, int32_t print_quantity, const std::string &attachments);
         DB_RESULT update_order(const std::string &serial_number, const std::string &name, const std::string &description,
-                          int64_t customer_id, int32_t print_quantity, const std::string &attachments);
+                          const std::string &customer_name, int32_t print_quantity, const std::string &attachments);
         DB_RESULT update_order(const Order &order);  // 新增：传入Order结构体的更新接口
         DB_RESULT get_all_orders(std::vector<Order> &out_orders);
 		DB_RESULT get_order_by_id(int64_t order_id, Order &out_order);
         DB_RESULT get_order_by_serial(const std::string &serial_number, Order &out_order);
-        DB_RESULT get_orders_by_customer(int64_t customer_id, std::vector<Order> &out_orders);
+        DB_RESULT get_orders_by_customer(const std::string &customer_name, std::vector<Order> &out_orders);
 
 
         // EmbedDevice operations
@@ -333,7 +332,7 @@ namespace lmdb
                                int total_quantity, int completed_quantity);
         DB_RESULT update_print_task(const std::string &print_name, const std::string &new_print_name, const std::string &file_uuid,
                                int total_quantity, int completed_quantity);
-        DB_RESULT update_print_task(const PrintTask &task);  // 新增：传入PrintTask结构体的更新接口
+        DB_RESULT update_print_task(const PrintTask &task);  //
         DB_RESULT get_all_print_tasks(std::vector<PrintTask> &out_tasks);
         DB_RESULT get_print_task_by_id(int64_t print_task_id, PrintTask &out_task);
         DB_RESULT get_print_tasks_by_order(const std::string &order_serial_number, std::vector<PrintTask> &out_tasks);
@@ -341,16 +340,17 @@ namespace lmdb
 
 
         // File record operations
-        DB_RESULT add_file_record(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type = "gcode");
-        DB_RESULT add_file_record(File_record &file);  // 新增：传入File_record结构体的接口
+        DB_RESULT add_file_record(const std::string& filename, const std::string& aeskey, const std::string& customer_name, const std::string& file_type = "gcode");
+        DB_RESULT add_file_record(File_record &file);  //
         DB_RESULT remove_file_record(const std::string& uuid);
-        DB_RESULT update_file_record(const std::string& uuid, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type = "gcode");
-        DB_RESULT update_file_record(const File_record &file);  // 新增：传入File_record结构体的更新接口
+        DB_RESULT update_file_record(const std::string& uuid, const std::string& filename, const std::string& aeskey, const std::string& customer_name, const std::string& file_type = "gcode");
+        DB_RESULT update_file_record(File_record &file);  // 
+        DB_RESULT set_file_aeskey_by_uuid(const std::string& uuid, const std::string& aeskey);  //
         DB_RESULT get_all_file_records(std::vector<File_record> &out_files);
-        DB_RESULT get_file_records_by_customer(int customer_id, std::vector<File_record> &out_files);  // 新增：按客户ID获取文件
+        DB_RESULT get_file_records_by_customer(const std::string& customer_name, std::vector<File_record> &out_files);  //
         DB_RESULT get_file_record(const std::string& uuid, File_record &out_file);
         DB_RESULT get_total_file_records_count(int &out_count);
-        DB_RESULT get_file_records_count_by_customer(int customer_id, int &out_count);  // 新增：获取指定客户的文件数量
+        DB_RESULT get_file_records_count_by_customer(const std::string& customer_name, int &out_count);  //
 
         // Order-File relationship operations 
         DB_RESULT add_order_file_relation(int order_id, const std::string& file_uuid, const std::string& description = "");
@@ -367,11 +367,11 @@ namespace lmdb
 
         // File encryption and decryption operations (static functions)
   
-        static DB_RESULT encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& output_path, int chunk_index = 0, bool append_mode = false);
-        static DB_RESULT decrypt_file_with_key(const std::string& input_path, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data);
-        static DB_RESULT decrypt_file_chunk(const std::string& input_path, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data);  // 新增：解密指定块
-        static DB_RESULT generate_random_aes_key(std::vector<uint8_t>& out_key);
-        static DB_RESULT generate_uuid(std::string& out_uuid);
+        DB_RESULT encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& file_uuid,int chunk_index = 0, bool append_mode = false);
+        DB_RESULT decrypt_file_with_key(const std::string& file_uuid, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data);
+        DB_RESULT decrypt_file_chunk(const std::string& file_uuid, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data);  // 新增：解密指定块
+        DB_RESULT generate_random_aes_key(std::vector<uint8_t>& out_key);
+        DB_RESULT generate_uuid(std::string& out_uuid);
 
         // Statistics
         DB_RESULT get_total_orders_count(int &out_count);
@@ -384,7 +384,7 @@ namespace lmdb
         void print(const std::string &query = "");
 
         const std::string& get_database_path() const;
-        
+        const std::string& get_file_dir() const; 
         // Database backup and restore
         DB_RESULT backup_database(const std::string& backup_path);
         DB_RESULT restore_database(const std::string& backup_path);
@@ -404,9 +404,11 @@ namespace lmdb
         // Static utility functions
         static std::vector<std::string> enumerate_database_files(const std::string& data_directory = "");
         static std::string get_default_data_directory();
+        
 
     protected:
         lmDBCoreImpl *impl;
         std::string db_path_;
+        std::string file_dir_;  
     };
 }

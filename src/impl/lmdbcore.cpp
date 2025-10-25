@@ -237,7 +237,7 @@ REGISTER_AUTO_KEY(Customer, id)
 YLT_REFL(Customer, id, name, phone, email, avatar_image, address, company, position, notes, created_at, updated_at)
 
 REGISTER_AUTO_KEY(Order, id)
-YLT_REFL(Order, id, name, serial_number, description, attachments, print_quantity, customer_id, created_at, updated_at)
+YLT_REFL(Order, id, name, serial_number, description, attachments, print_quantity, customer_name, created_at, updated_at)
 
 REGISTER_AUTO_KEY(EmbedDevice, device_id)
 YLT_REFL(EmbedDevice, device_id, device_name, device_type, model, serial_number, firmware_version, hardware_version, manufacturer, ip_address, port, mac_address, status, location, description, last_seen, created_at, updated_at, session_id, capabilities, metadata)
@@ -246,7 +246,7 @@ REGISTER_AUTO_KEY(PrintTask, id)
 YLT_REFL(PrintTask, id, order_serial_number, print_name, file_uuid, total_quantity, completed_quantity)
 
 REGISTER_AUTO_KEY(File_record, id)
-YLT_REFL(File_record, id, uuid, filename, encrypted_path, aeskey, upload_time, file_type, customer_id)
+YLT_REFL(File_record, id, uuid, filename, aeskey, upload_time, file_type, customer_name)
 
 REGISTER_AUTO_KEY(OrderFile, id)
 YLT_REFL(OrderFile, id, order_id, file_uuid, created_at, description)
@@ -279,6 +279,9 @@ namespace lmdb {
         
         // Connect to database
         impl->sqlite.connect(db_path_);
+
+        file_dir_ = dbDir + "/" + db_name + "/file";
+        createDirectoryIfNotExists(file_dir_);
     }   
 
     lmDBCore::~lmDBCore() 
@@ -290,6 +293,11 @@ namespace lmdb {
     const std::string& lmDBCore::get_database_path() const
     {
         return db_path_;
+    }
+
+    const std::string& lmDBCore::get_file_dir() const
+    {
+        return  file_dir_;
     }
 
     DB_RESULT lmDBCore::initialize()
@@ -1090,15 +1098,15 @@ namespace lmdb {
 
 
     // Order operations
-    DB_RESULT lmDBCore::add_order(const std::string& name, const std::string& description, int64_t customer_id, 
-                             int32_t print_quantity, const std::string& attachments)
+    DB_RESULT lmDBCore::add_order(const std::string& name, const std::string& description, const std::string& customer_name, 
+                             int32_t print_quantity, const std::string& attachments, std::string& out_serial_number)
     {
         try
         {
             Order order;
             order.name = name;
             order.description = description;
-            order.customer_id = customer_id;
+            order.customer_name = customer_name;
             order.print_quantity = print_quantity;
             order.attachments = attachments;
             order.serial_number = generateOrderSerialNumber();
@@ -1117,6 +1125,7 @@ namespace lmdb {
             order.updated_at = static_cast<int64_t>(now);
 
             impl->sqlite.insert(order);
+            out_serial_number = order.serial_number;
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -1127,7 +1136,7 @@ namespace lmdb {
     }
 
     // 新增：传入Order结构体的add_order接口
-    DB_RESULT lmDBCore::add_order(Order &order)
+    DB_RESULT lmDBCore::add_order(Order &order, std::string &out_serial_number)
     {
         try
         {
@@ -1140,24 +1149,21 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (order.customer_id <= 0) {
+            if (order.customer_name.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            auto existing_serial = impl->sqlite.query_s<Order>("serial_number = ?", order.serial_number);
-            if (!existing_serial.empty())
-            {
-                // Generate a new serial number if collision occurs
-                return DB_ERROR_DUPLICATE_RECORD; // Order name already exists
-            }
-
-
+            // Generate serial number if not provided
+       
+            order.serial_number = generateOrderSerialNumber();
+    
             // Set timestamps
             time_t now = time(0);
             order.created_at = static_cast<int64_t>(now);
             order.updated_at = static_cast<int64_t>(now);
             
             impl->sqlite.insert(order);
+            out_serial_number = order.serial_number;
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -1204,7 +1210,7 @@ namespace lmdb {
     }
 
     DB_RESULT lmDBCore::update_order(int64_t order_id, const std::string& name, const std::string& description,
-                                int64_t customer_id, int32_t print_quantity, const std::string& attachments)
+                                const std::string& customer_name, int32_t print_quantity, const std::string& attachments)
     {
         try
         {
@@ -1217,7 +1223,7 @@ namespace lmdb {
             Order order = orders[0];
             order.name = name;
             order.description = description;
-            order.customer_id = customer_id;
+            order.customer_name = customer_name;
             order.print_quantity = print_quantity;
             order.attachments = attachments;
             order.updated_at = static_cast<int64_t>(time(0));
@@ -1233,7 +1239,7 @@ namespace lmdb {
     }
 
     DB_RESULT lmDBCore::update_order(const std::string& serial, const std::string& new_name, const std::string& description,
-                               int64_t customer_id, int32_t print_quantity, const std::string& attachments)
+                               const std::string& customer_name, int32_t print_quantity, const std::string& attachments)
     {
         try
         {
@@ -1249,7 +1255,7 @@ namespace lmdb {
             Order order = orders[0];
             order.name = new_name;
             order.description = description;
-            order.customer_id = customer_id;
+            order.customer_name = customer_name;
             order.print_quantity = print_quantity;
             order.attachments = attachments;
             order.updated_at = static_cast<int64_t>(time(0));
@@ -1343,11 +1349,11 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_orders_by_customer(int64_t customer_id, std::vector<Order> &out_orders)
+    DB_RESULT lmDBCore::get_orders_by_customer(const std::string& customer_name, std::vector<Order> &out_orders)
     {
         try
         {
-            out_orders = impl->sqlite.query_s<Order>("customer_id = ?", customer_id);
+            out_orders = impl->sqlite.query_s<Order>("customer_name = ?", customer_name);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -1854,7 +1860,7 @@ namespace lmdb {
     }
 
     // G-code file operations
-    DB_RESULT lmDBCore::add_file_record(const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type)
+    DB_RESULT lmDBCore::add_file_record(const std::string& filename, const std::string& aeskey, const std::string& customer_name, const std::string& file_type)
     {
         try
         {
@@ -1875,9 +1881,8 @@ namespace lmdb {
             File_record file_record;
             file_record.uuid = uuid;
             file_record.filename = filename;
-            file_record.encrypted_path = encrypted_path;
             file_record.file_type = file_type;
-            file_record.customer_id = customer_id;
+            file_record.customer_name = customer_name;
             
             // Copy AES key
             file_record.aeskey = aeskey;
@@ -1897,8 +1902,6 @@ namespace lmdb {
             return DB_ERROR_SQL_EXECUTION;
         }
     }
-
-
 
     DB_RESULT lmDBCore::get_all_file_records(std::vector<File_record> &out_files)
     {
@@ -1947,7 +1950,7 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::update_file_record(const std::string& uuid, const std::string& filename, const std::string& encrypted_path, const std::string& aeskey, int customer_id, const std::string& file_type)
+    DB_RESULT lmDBCore::update_file_record(const std::string& uuid, const std::string& filename, const std::string& aeskey, const std::string& customer_name, const std::string& file_type)
     {
         try
         {
@@ -1959,10 +1962,9 @@ namespace lmdb {
 
             File_record file = file_records[0];
             file.filename = filename;
-            file.encrypted_path = encrypted_path;
             file.aeskey = aeskey;
             file.file_type = file_type;
-            file.customer_id = customer_id;
+            file.customer_name = customer_name;
             
             impl->sqlite.update(file);
             return DB_SUCCESS;
@@ -1989,11 +1991,11 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_file_records_by_customer(int customer_id, std::vector<File_record> &out_files)
+    DB_RESULT lmDBCore::get_file_records_by_customer(const std::string& customer_name, std::vector<File_record> &out_files)
     {
         try
         {
-            out_files = impl->sqlite.query_s<File_record>("customer_id = ?", customer_id);
+            out_files = impl->sqlite.query_s<File_record>("customer_name = ?", customer_name);
             return DB_SUCCESS;
         }
         catch (const std::exception &e)
@@ -2003,11 +2005,11 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::get_file_records_count_by_customer(int customer_id, int &out_count)
+    DB_RESULT lmDBCore::get_file_records_count_by_customer(const std::string& customer_name, int &out_count)
     {
         try
         {
-            auto file_records = impl->sqlite.query_s<File_record>("customer_id = ?", customer_id);
+            auto file_records = impl->sqlite.query_s<File_record>("customer_name = ?", customer_name);
             out_count = static_cast<int>(file_records.size());
             return DB_SUCCESS;
         }
@@ -2573,10 +2575,11 @@ namespace lmdb {
             
             // Add test orders
             std::cout << "Adding test orders...\n";
-            add_order("Prototype Parts", "Initial prototype for ABC Company", 1);
-            add_order("Production Batch 1", "First production batch", 1);
-            add_order("Custom Design", "Custom 3D printed parts for XYZ Corp", 2);
-            add_order("R&D Samples", "Research and development samples", 3);
+            std::string serial;
+            add_order("Prototype Parts", "Initial prototype for ABC Company", "ABC Company", 1, "", serial);
+            add_order("Production Batch 1", "First production batch", "ABC Company", 1, "", serial);
+            add_order("Custom Design", "Custom 3D printed parts for XYZ Corp", "XYZ Corp", 1, "", serial);
+            add_order("R&D Samples", "Research and development samples", "XYZ Corp", 1, "", serial);
             
             // Add test print tasks
             std::cout << "Adding test print tasks...\n";
@@ -2619,9 +2622,9 @@ namespace lmdb {
             std::string key2 = bytesToHex(key2_bytes);
             std::string key3 = bytesToHex(key3_bytes);
             
-            add_file_record("part_a_proto.gcode", "./enc_resource/part_a_proto.enc", key1, 1, "gcode");
-            add_file_record("part_b_proto.gcode", "./enc_resource/part_b_proto.enc", key2, 1, "gcode");
-            add_file_record("custom_part1.gcode", "./enc_resource/custom_part1.enc", key3, 2, "gcode");
+            add_file_record("part_a_proto.gcode", key1, "dd", "gcode");
+            add_file_record("part_b_proto.gcode", key2, "bb", "gcode");
+            add_file_record("custom_part1.gcode", key3, "cc", "gcode");
             
             std::cout << "Test data populated successfully!\n";
             std::cout << "Generated AES keys:\n";
@@ -2678,9 +2681,13 @@ namespace lmdb {
             file.close();
             
             // Test encryption using new data stream to file interface
-            DB_RESULT encrypt_result = lmDBCore::encrypt_file_with_key(file_data, random_key, encrypted_path);
+            std::string test_uuid;
+            lmDBCore::generate_uuid(test_uuid);
+            std::string db_dir = "./data";
+            DB_RESULT encrypt_result = lmDBCore::encrypt_file_with_key(file_data, random_key, test_uuid);
             if (encrypt_result == DB_SUCCESS) {
-                std::cout << "   ✓ Encryption successful, data written to: " << encrypted_path << std::endl;
+                std::string actual_path = db_dir + "/file/" + test_uuid + ".enc";
+                std::cout << "   ✓ Encryption successful, data written to: " << actual_path << std::endl;
                 
                 // Test chunked encryption
                 std::cout << "\n5. Testing chunked encryption...\n";
@@ -2697,7 +2704,8 @@ namespace lmdb {
                     std::vector<uint8_t> chunk_data(file_data.begin() + start, file_data.begin() + end);
                     bool append_mode = (i > 0);  // First chunk overwrites, others append
                     
-                    DB_RESULT chunk_result = lmDBCore::encrypt_file_with_key(chunk_data, random_key, chunked_encrypted_path, i, append_mode);
+                    std::string chunk_uuid = test_uuid + "_chunk_" + std::to_string(i);
+                    DB_RESULT chunk_result = lmDBCore::encrypt_file_with_key(chunk_data, random_key, chunk_uuid, i, append_mode);
                     if (chunk_result == DB_SUCCESS) {
                         std::cout << "   ✓ Chunk " << i << " encrypted successfully (size: " << chunk_data.size() << " bytes)" << std::endl;
                     } else {
@@ -2708,7 +2716,7 @@ namespace lmdb {
                 // Test decryption of chunked file
                 std::cout << "\n6. Testing chunked decryption...\n";
                 std::vector<uint8_t> decrypted_chunked_data;
-                DB_RESULT decrypt_chunked_result = lmDBCore::decrypt_file_with_key(chunked_encrypted_path, random_key, decrypted_chunked_data);
+                DB_RESULT decrypt_chunked_result = lmDBCore::decrypt_file_with_key(test_uuid, random_key, decrypted_chunked_data);
                 if (decrypt_chunked_result == DB_SUCCESS) {
                     std::cout << "   ✓ Chunked decryption successful, data size: " << decrypted_chunked_data.size() << " bytes" << std::endl;
                     
@@ -2726,7 +2734,7 @@ namespace lmdb {
                 std::cout << "\n7. Testing individual chunk decryption...\n";
                 for (int i = 0; i < 3; ++i) {
                     std::vector<uint8_t> chunk_data;
-                    DB_RESULT chunk_decrypt_result = lmDBCore::decrypt_file_chunk(chunked_encrypted_path, random_key, i, chunk_data);
+                    DB_RESULT chunk_decrypt_result = lmDBCore::decrypt_file_chunk(test_uuid, random_key, i, chunk_data);
                     if (chunk_decrypt_result == DB_SUCCESS) {
                         std::cout << "   ✓ Chunk " << i << " decrypted successfully (size: " << chunk_data.size() << " bytes)" << std::endl;
                     } else {
@@ -2736,7 +2744,7 @@ namespace lmdb {
                 
                 // Store G-code file info in database
                 std::cout << "   Storing G-code info in database...\n";
-                bool db_success = add_file_record("test_sample.gcode", encrypted_path, password, 1, "gcode");
+                bool db_success = add_file_record("test_sample.gcode", password, "cc", "gcode");
                 if (db_success) {
                     std::cout << "   ✓ G-code info stored in database successfully\n";
                 } else {
@@ -2779,7 +2787,7 @@ namespace lmdb {
             
             // Test decryption using new file to data stream interface
             std::vector<uint8_t> decrypted_data;
-            DB_RESULT decrypt_result = lmDBCore::decrypt_file_with_key(encrypted_path, db_key, decrypted_data);
+            DB_RESULT decrypt_result = lmDBCore::decrypt_file_with_key(test_uuid, db_key, decrypted_data);
             if (decrypt_result == DB_SUCCESS) {
                 std::cout << "   ✓ Decryption successful, data size: " << decrypted_data.size() << " bytes" << std::endl;
                 
@@ -2906,9 +2914,6 @@ namespace lmdb {
                 return DB_ERROR_INVALID_PARAMETER;
             }
             
-            if (file.encrypted_path.empty()) {
-                return DB_ERROR_INVALID_PARAMETER;
-            }
             
             if (file.aeskey.empty()) {
                 return DB_ERROR_INVALID_PARAMETER;
@@ -2943,7 +2948,7 @@ namespace lmdb {
     }
 
     // 新增：传入File_record结构体的update_file_record接口
-    DB_RESULT lmDBCore::update_file_record(const File_record &file)
+    DB_RESULT lmDBCore::update_file_record(File_record &file)
     {
         try
         {
@@ -2957,7 +2962,7 @@ namespace lmdb {
             {
                 return DB_ERROR_RECORD_NOT_FOUND;
             }
-
+            file.aeskey = existing[0].aeskey;
      
             impl->sqlite.update(file);
             return DB_SUCCESS;
@@ -2965,6 +2970,41 @@ namespace lmdb {
         catch (const std::exception &e)
         {
             std::cerr << "Update gcode file (struct) failed: " << e.what() << std::endl;
+            return DB_ERROR_SQL_EXECUTION;
+        }
+    }
+
+    //  
+    DB_RESULT lmDBCore::set_file_aeskey_by_uuid(const std::string& uuid, const std::string& aeskey)
+    {
+        try
+        {
+            //  
+            if (uuid.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            if (aeskey.empty()) {
+                return DB_ERROR_INVALID_PARAMETER;
+            }
+            
+            //  
+            auto existing = impl->sqlite.query_s<File_record>("uuid = ?", uuid);
+            if (existing.empty())
+            {
+                return DB_ERROR_RECORD_NOT_FOUND;
+            }
+            
+            //  
+            File_record file = existing[0];
+            file.aeskey = aeskey;
+            
+            impl->sqlite.update(file);
+            return DB_SUCCESS;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Set file aeskey by UUID failed: " << e.what() << std::endl;
             return DB_ERROR_SQL_EXECUTION;
         }
     }
@@ -3111,11 +3151,28 @@ namespace lmdb {
             
             // Test add order
             std::cout << "   4.1 Test add_order():\n";
-            DB_RESULT add_order_result1 = add_order("Test Order 1", "Order Description 1", 1, 10, "Attachment 1");
+            std::string serial1;
+            DB_RESULT add_order_result1 = add_order("Test Order 1", "Order Description 1", "Test Customer 1", 10, "Attachment 1", serial1);
             std::cout << "      - Add order 1: " << (add_order_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
-            DB_RESULT add_order_result2 = add_order("Test Order 2", "Order Description 2", 2, 20, "Attachment 2");
+            std::string serial2;
+            DB_RESULT add_order_result2 = add_order("Test Order 2", "Order Description 2", "Test Customer 2", 20, "Attachment 2", serial2);
             std::cout << "      - Add order 2: " << (add_order_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            
+            // Test add_order with Order struct
+            std::cout << "   4.1.1 Test add_order(Order&):\n";
+            Order test_order1;
+            test_order1.name = "Test Order 3";
+            test_order1.description = "Order Description 3";
+            test_order1.customer_name = "Test Customer 3";
+            test_order1.print_quantity = 30;
+            test_order1.attachments = "Attachment 3";
+            // serial_number will be generated automatically
+            
+            std::string test_serial;
+            DB_RESULT add_order_struct_result = add_order(test_order1, test_serial);
+            std::cout << "      - Add order 3 (struct): " << (add_order_struct_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
+            std::cout << "      - Generated serial number: " << test_serial << std::endl;
             
             // Test get order
             std::cout << "   4.2 Test get_order_by_id():\n";
@@ -3125,13 +3182,13 @@ namespace lmdb {
             
             // Test update order
             std::cout << "   4.3 Test update_order():\n";
-            DB_RESULT update_order_result = update_order(1, "Updated Order 1", "Updated Description 1", 1, 15, "Updated Attachment 1");
+            DB_RESULT update_order_result = update_order(1, "Updated Order 1", "Updated Description 1", "Test Customer 1", 15, "Updated Attachment 1");
             std::cout << "      - Update order 1: " << (update_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // Test get orders by customer
             std::cout << "   4.4 Test get_orders_by_customer():\n";
             std::vector<Order> customer_orders;
-            DB_RESULT get_orders_by_customer_result = get_orders_by_customer(1, customer_orders);
+            DB_RESULT get_orders_by_customer_result = get_orders_by_customer("Test Customer 1", customer_orders);
             std::cout << "      - Get customer 1 orders count: " << (get_orders_by_customer_result == DB_SUCCESS ? std::to_string(customer_orders.size()) : "FAILED") << " orders" << std::endl;
             
             // Test get all orders
@@ -3229,11 +3286,11 @@ namespace lmdb {
             // Test add G-code file
             std::cout << "   7.1 Test add_file_record():\n";
             std::string test_key1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-            DB_RESULT add_file_result1 = add_file_record("test1.gcode", "./enc/test1.enc", test_key1, 1, "gcode");
+            DB_RESULT add_file_result1 = add_file_record("test1.gcode", test_key1, "ss", "gcode");
             std::cout << "      - Add file record 1: " << (add_file_result1 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             std::string test_key2 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-            DB_RESULT add_file_result2 = add_file_record("test2.gcode", "./enc/test2.enc", test_key2, 2, "gcode");
+            DB_RESULT add_file_result2 = add_file_record("test2.gcode", test_key2, "yy", "gcode");
             std::cout << "      - Add file record 2: " << (add_file_result2 == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // Test get file record
@@ -3266,9 +3323,14 @@ namespace lmdb {
             // Test update file record
             std::cout << "   7.3 Test update_file_record():\n";
             std::string new_key = "1111111111111111111111111111111111111111111111111111111111111111";
-            DB_RESULT update_file_result = update_file_record(file1.uuid, "updated_test1.gcode", "./enc/updated_test1.enc", new_key, 1, "gcode");
+            DB_RESULT update_file_result = update_file_record(file1.uuid, "updated_test1.gcode", new_key, "Customer1", "gcode");
             std::cout << "      - Update file record 1: " << (update_file_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
+            // Test set file aeskey by UUID
+            std::cout << "   7.3.1 Test set_file_aeskey_by_uuid():\n";
+            std::string new_aeskey = "2222222222222222222222222222222222222222222222222222222222222222";
+            DB_RESULT set_aeskey_result = set_file_aeskey_by_uuid(file1.uuid, new_aeskey);
+            std::cout << "      - Set aeskey for file 1: " << (set_aeskey_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             // Test get all file records
             std::cout << "   7.4 Test get_all_file_records():\n";
@@ -3285,21 +3347,21 @@ namespace lmdb {
             // Test get file records by customer
             std::cout << "   7.6 Test get_file_records_by_customer():\n";
             std::vector<File_record> customer1_files;
-            DB_RESULT get_customer1_result = get_file_records_by_customer(1, customer1_files);
+            DB_RESULT get_customer1_result = get_file_records_by_customer("Customer1", customer1_files);
             std::cout << "      - Customer 1 files count: " << (get_customer1_result == DB_SUCCESS ? std::to_string(customer1_files.size()) : "FAILED") << " files" << std::endl;
             
             std::vector<File_record> customer2_files;
-            DB_RESULT get_customer2_result = get_file_records_by_customer(2, customer2_files);
+            DB_RESULT get_customer2_result = get_file_records_by_customer("Customer2", customer2_files);
             std::cout << "      - Customer 2 files count: " << (get_customer2_result == DB_SUCCESS ? std::to_string(customer2_files.size()) : "FAILED") << " files" << std::endl;
             
             // Test get file records count by customer
             std::cout << "   7.7 Test get_file_records_count_by_customer():\n";
             int customer1_count = 0;
-            DB_RESULT get_customer1_count_result = get_file_records_count_by_customer(1, customer1_count);
+            DB_RESULT get_customer1_count_result = get_file_records_count_by_customer("Customer1", customer1_count);
             std::cout << "      - Customer 1 files count: " << (get_customer1_count_result == DB_SUCCESS ? std::to_string(customer1_count) : "FAILED") << " files" << std::endl;
             
             int customer2_count = 0;
-            DB_RESULT get_customer2_count_result = get_file_records_count_by_customer(2, customer2_count);
+            DB_RESULT get_customer2_count_result = get_file_records_count_by_customer("Customer2", customer2_count);
             std::cout << "      - Customer 2 files count: " << (get_customer2_count_result == DB_SUCCESS ? std::to_string(customer2_count) : "FAILED") << " files" << std::endl;
             
             // Test UUID generation
@@ -3320,11 +3382,12 @@ namespace lmdb {
             test_order.serial_number = "ORD-FILE-001";
             test_order.description = "Test order for file relationship testing";
             test_order.print_quantity = 100;
-            test_order.customer_id = 1;
+            test_order.customer_name = "abc company";
             test_order.created_at = time(0);
             test_order.updated_at = time(0);
             
-            DB_RESULT add_order_result = add_order(test_order);
+            std::string test_serial2;
+            DB_RESULT add_order_result = add_order(test_order, test_serial2);
             std::cout << "      - Add test order: " << (add_order_result == DB_SUCCESS ? "SUCCESS" : "FAILED") << std::endl;
             
             if (add_order_result == DB_SUCCESS) {
@@ -3483,10 +3546,17 @@ namespace lmdb {
     }
 
 
-    DB_RESULT lmDBCore::encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& output_path, int chunk_index, bool append_mode)
+    DB_RESULT lmDBCore::encrypt_file_with_key(const std::vector<uint8_t>& input_data, const std::vector<uint8_t>& key, const std::string& file_uuid, int chunk_index, bool append_mode)
     {
         try
         {
+            // Construct output path: db_dir + "file" + file_uuid + ".enc"
+            std::string file_dir =  get_file_dir();
+            std::string output_path = file_dir + "/" + file_uuid + ".enc";
+            
+            // Create directory if it doesn't exist
+            createDirectoryIfNotExists(file_dir);
+            
             lm::crypto::AESEncryption encryption(key);
             std::vector<uint8_t> encrypted_data = encryption.encrypt(input_data);
             
@@ -3539,11 +3609,14 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::decrypt_file_with_key(const std::string& input_path, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data)
+    DB_RESULT lmDBCore::decrypt_file_with_key(const std::string& file_uuid, const std::vector<uint8_t>& key, std::vector<uint8_t>& output_data)
     {
         try
         {
             output_data.clear();
+            
+            // Construct input path from UUID and file_dir_
+            std::string input_path = file_dir_ + "/" + file_uuid + ".enc";
             
             // Read encrypted file data
             std::ifstream in_file(input_path, std::ios::binary);
@@ -3635,11 +3708,14 @@ namespace lmdb {
         }
     }
 
-    DB_RESULT lmDBCore::decrypt_file_chunk(const std::string& input_path, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data)
+    DB_RESULT lmDBCore::decrypt_file_chunk(const std::string& file_uuid, const std::vector<uint8_t>& key, int chunk_index, std::vector<uint8_t>& output_data)
     {
         try
         {
             output_data.clear();
+            
+            // Construct input path from UUID and file_dir_
+            std::string input_path = file_dir_ + "/" + file_uuid + ".enc";
             
             // Read encrypted file data
             std::ifstream in_file(input_path, std::ios::binary);
